@@ -1,3 +1,9 @@
+# Before training
+python -m features.export_parquet
+
+# With profiler
+python -m models.run_training --quick-test --profile
+
 # Quick test (few minutes)
 python -m models.run_training --quick-test
 

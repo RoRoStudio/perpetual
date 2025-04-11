@@ -9,12 +9,14 @@ import subprocess
 import argparse
 import time
 from datetime import datetime
+from models.profiler import TrainingProfiler
 
 def main():
     parser = argparse.ArgumentParser(description="Run Deribit model training with optimal settings")
     parser.add_argument("--fast", action="store_true", help="Run in fast mode (one instrument, few epochs)")
     parser.add_argument("--quick-test", action="store_true", help="Run in quick test mode (minimal training to verify setup)")
     parser.add_argument("--full", action="store_true", help="Run full training on all instruments")
+    parser.add_argument("--profile", action="store_true", help="Enable detailed performance profiling")
     args = parser.parse_args()
     
     # Determine run mode
@@ -33,6 +35,11 @@ def main():
         cmd = ["python", "-m", "models.train_unified", "--instruments", 
                "BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL", "SOL_USDC-PERPETUAL", 
                "XRP_USDC-PERPETUAL", "DOGE_USDC-PERPETUAL"]
+    
+    # Add profiling flag if enabled
+    if args.profile:
+        cmd.append("--profile")
+        print("🔍 Performance profiling enabled")
     
     # Print run information
     print("\n" + "="*50)
