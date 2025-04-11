@@ -594,23 +594,7 @@ def train_unified_model(
             torch.cuda.empty_cache()
 
 
-def train_optimized(
-    model,
-    train_loader,
-    val_loader,
-    optimizer,
-    scheduler,
-    scaler,
-    num_epochs=20,
-    device="cuda",
-    patience=5,
-    gradient_accumulation=1,
-    model_save_path="/mnt/p/perpetual/models/checkpoints",
-    experiment_name=None,
-    debug=False,
-    use_wandb=True,
-    profiler=None
-):
+def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scaler, num_epochs=20, device="cuda", patience=5, gradient_accumulation=1, model_save_path="/mnt/p/perpetual/models/checkpoints", experiment_name=None, debug=False, use_wandb=True, profiler=None):
     """
     Optimized training function with mixed precision, gradient accumulation and enhanced monitoring.
     
@@ -629,6 +613,7 @@ def train_optimized(
         experiment_name: Name of the experiment for checkpoints
         debug: Enable debug mode for faster runs
         use_wandb: Whether to use W&B for tracking
+        profiler: Optional profiler for performance tracking
     """
     print(f"🚀 Starting optimized training on {device} with mixed precision")
     print(f"📊 Using batch size {train_loader.batch_size} × {gradient_accumulation} accumulation steps")
@@ -665,96 +650,108 @@ def train_optimized(
     
     # Training loop
     for epoch in range(num_epochs):
-        # Profile entire epoch if profiler exists
-        epoch_context = profiler.profile_region(f"epoch_{epoch}") if profiler else nullcontext()
-        with epoch_context:
-            epoch_start_time = time.time()
+        # Profile epoch time
+        if profiler:
+            profiler.start_operation(f"epoch_{epoch}")
+        
+        epoch_start_time = time.time()
+        
+        # ===== TRAINING =====
+        model.train()
+        train_losses = []
+        train_direction_correct = 0
+        train_direction_total = 0
+        train_return_mse_sum = 0
+        
+        optimizer.zero_grad()  # Zero gradients at start of epoch
+        
+        # Use tqdm with a higher update frequency for more responsive UI
+        for batch_idx, (features, targets) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", miniters=10)):
+            # Profile data loading and transfer
+            if profiler:
+                profiler.start_operation("data_transfer")
+                
+            # Move to device and ensure data is clean - use non_blocking for async transfer
+            features = features.to(device, non_blocking=True)
+            features = torch.nan_to_num(features)
             
-            # ===== TRAINING =====
-            model.train()
-            train_losses = []
-            train_direction_correct = 0
-            train_direction_total = 0
-            train_return_mse_sum = 0
+            # Move all target tensors to device with non_blocking
+            targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
             
-            optimizer.zero_grad()  # Zero gradients at start of epoch
+            if profiler:
+                profiler.end_operation("data_transfer")
+                profiler.start_operation("forward")
             
-            # Use tqdm with a higher update frequency for more responsive UI
-            for batch_idx, (features, targets) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", miniters=10)):
-                # Profile data transfer if profiler exists
-                data_context = profiler.profile_region("data_transfer") if profiler else nullcontext()
-                with data_context:
-                    # Move to device and ensure data is clean - use non_blocking for async transfer
-                    features = features.to(device, non_blocking=True)
-                    features = torch.nan_to_num(features)
-                    
-                    # Move all target tensors to device with non_blocking
-                    targets = {k: v.to(device, non_blocking=True) for k, v in targets.items()}
+            # Get instrument IDs for asset-aware models
+            asset_ids = targets.get('instrument_id')
+            
+            # Mixed precision forward pass
+            with autocast():
+                outputs = model(features, targets['funding_rate'], asset_ids)
+            
+            if profiler:
+                profiler.end_operation("forward") 
+                profiler.start_operation("loss_computation")
+            
+            with autocast():
+                # Compute losses
+                direction_loss = direction_criterion(outputs['direction_logits'], targets['direction_class'].squeeze())
+                return_loss = regression_criterion(outputs['expected_return'], targets['next_return_1bar'])
+                risk_loss = regression_criterion(outputs['expected_risk'], targets['next_volatility'])
                 
-                # Get instrument IDs for asset-aware models
-                asset_ids = targets.get('instrument_id')
+                # Combined loss with weighting
+                loss = direction_loss + return_loss + 0.5 * risk_loss
                 
-                # Profile forward pass
-                forward_context = profiler.profile_region("forward") if profiler else nullcontext()
-                with forward_context:
-                    # Mixed precision forward pass
-                    with autocast():
-                        outputs = model(features, targets['funding_rate'], asset_ids)
-                
-                # Profile loss computation
-                loss_context = profiler.profile_region("loss_computation") if profiler else nullcontext()
-                with loss_context:
-                    with autocast():
-                        # Compute losses
-                        direction_loss = direction_criterion(outputs['direction_logits'], targets['direction_class'].squeeze())
-                        return_loss = regression_criterion(outputs['expected_return'], targets['next_return_1bar'])
-                        risk_loss = regression_criterion(outputs['expected_risk'], targets['next_volatility'])
-                        
-                        # Combined loss with weighting
-                        loss = direction_loss + return_loss + 0.5 * risk_loss
-                        
-                        # Scale loss by gradient accumulation steps
-                        loss = loss / gradient_accumulation
-                
-                # Profile backward pass
-                backward_context = profiler.profile_region("backward") if profiler else nullcontext()
-                with backward_context:
-                    # Mixed precision backward pass
-                    scaler.scale(loss).backward()
-                
-                # Only update weights after accumulating gradients
-                if (batch_idx + 1) % gradient_accumulation == 0:
-                    # Profile optimizer step
-                    optim_context = profiler.profile_region("optimizer_step") if profiler else nullcontext()
-                    with optim_context:
-                        # Unscale gradients for clipping
-                        scaler.unscale_(optimizer)
-                        
-                        # Clip gradients to prevent explosion
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        
-                        # Update weights and zero gradients
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad(set_to_none=True)
-                        
-                        # Update learning rate each batch with OneCycleLR
-                        scheduler.step()
-                
-                # Record metrics
-                train_losses.append(loss.item() * gradient_accumulation)  # Rescale loss back
-                
-                # Calculate accuracy
-                pred_direction = torch.argmax(outputs['direction_logits'], dim=1)
-                train_direction_correct += (pred_direction == targets['direction_class'].squeeze()).sum().item()
-                train_direction_total += targets['direction_class'].size(0)
-                
-                # Calculate MSE for returns
-                train_return_mse_sum += return_loss.item() * gradient_accumulation * targets['next_return_1bar'].size(0)
-                
-                # Step the profiler
+                # Scale loss by gradient accumulation steps
+                loss = loss / gradient_accumulation
+            
+            if profiler:
+                profiler.end_operation("loss_computation")
+                profiler.start_operation("backward")
+            
+            # Mixed precision backward pass
+            scaler.scale(loss).backward()
+            
+            if profiler:
+                profiler.end_operation("backward")
+            
+            # Only update weights after accumulating gradients
+            if (batch_idx + 1) % gradient_accumulation == 0:
                 if profiler:
-                    profiler.step(batch_size=features.size(0))
+                    profiler.start_operation("optimizer_step")
+                    
+                # Unscale gradients for clipping
+                scaler.unscale_(optimizer)
+                
+                # Clip gradients to prevent explosion
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # Update weights and zero gradients
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)  # set_to_none=True is faster than setting to zero
+                
+                # Update learning rate each batch with OneCycleLR
+                scheduler.step()
+                
+                if profiler:
+                    profiler.end_operation("optimizer_step")
+            
+            # Record metrics
+            train_losses.append(loss.item() * gradient_accumulation)  # Rescale loss back
+            
+            # Calculate accuracy
+            pred_direction = torch.argmax(outputs['direction_logits'], dim=1)
+            train_direction_correct += (pred_direction == targets['direction_class'].squeeze()).sum().item()
+            train_direction_total += targets['direction_class'].size(0)
+            
+            # Calculate MSE for returns
+            train_return_mse_sum += return_loss.item() * gradient_accumulation * targets['next_return_1bar'].size(0)
+            
+            # Record batch processing time if profiling
+            if profiler and batch_idx > 0:  # Skip first batch (warm-up)
+                batch_time = time.time() - epoch_start_time
+                profiler.record_batch_time(batch_time / batch_idx)  # Average time per batch so far
             
             # Log batch metrics to W&B (but not too frequently)
             if use_wandb and batch_idx % 20 == 0:
@@ -786,6 +783,9 @@ def train_optimized(
         train_return_mse = train_return_mse_sum / train_direction_total if train_direction_total > 0 else 0
         
         # ===== VALIDATION =====
+        if profiler:
+            profiler.start_operation("validation")
+            
         model.eval()
         val_losses = []
         val_direction_correct = 0
@@ -821,6 +821,9 @@ def train_optimized(
                 # Calculate MSE
                 val_return_mse_sum += return_loss.item() * targets['next_return_1bar'].size(0)
         
+        if profiler:
+            profiler.end_operation("validation")
+            
         # Calculate epoch metrics
         val_loss = np.mean(val_losses)
         val_direction_acc = val_direction_correct / val_direction_total if val_direction_total > 0 else 0
@@ -860,12 +863,20 @@ def train_optimized(
                 'epoch_duration': epoch_duration
             })
         
+        # Add epoch time to profiler
+        if profiler:
+            profiler.record_epoch_time(epoch_duration)
+            profiler.end_operation(f"epoch_{epoch}")
+            
         # Save if validation loss improved
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
             
             # Save best model
+            if profiler:
+                profiler.start_operation("save_best_model")
+                
             checkpoint_path = f"{checkpoint_base}_best.pt"
             torch.save({
                 'epoch': epoch,
@@ -876,6 +887,9 @@ def train_optimized(
                 'history': history
             }, checkpoint_path)
             
+            if profiler:
+                profiler.end_operation("save_best_model")
+                
             print(f"✅ Model improved! Saved to {checkpoint_path}")
             
             # Save to W&B
@@ -1014,6 +1028,13 @@ def main():
                       help="Export data to Parquet format before training")
     args = parser.parse_args()
     
+    # Initialize profiler if enabled
+    profiler = None
+    if args.profile:
+        from models.profiler import TrainingProfiler
+        profiler = TrainingProfiler("/mnt/p/perpetual/tmp")
+        print("🔍 Performance profiling enabled")
+    
     # Use W&B unless explicitly disabled
     use_wandb = not args.no_wandb
     
@@ -1149,9 +1170,6 @@ def main():
     
     # Set global random seed
     set_seed(42)
-
-    # Initialize profiler if enabled
-    profiler = TrainingProfiler(enabled=args.profile, profile_gpu=args.profile) if args.profile else None 
     
     # Train unified model
     train_unified_model(
@@ -1162,7 +1180,10 @@ def main():
         debug=args.debug,
         profiler=profiler
     )
-
+    
+    # Save profiling results
+    if profiler:
+        profiler.save_results()
 
 if __name__ == "__main__":
     main()
