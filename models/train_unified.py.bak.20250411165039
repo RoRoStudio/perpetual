@@ -457,7 +457,6 @@ def train_unified_model(
         training_params: Parameters for training
         use_wandb: Whether to use W&B for tracking
         debug: Enable debug mode for faster runs
-        profiler: Optional profiler for performance tracking
     """
     # Set device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -465,9 +464,6 @@ def train_unified_model(
     
     # Start W&B run with full system metrics logging
     if use_wandb:
-        if profiler:
-            profiler.start_operation("wandb_init")
-            
         run = wandb.init(
             project="deribit-perpetual-model",
             name=f"unified_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -493,16 +489,10 @@ def train_unified_model(
                 "cuda_version": torch.version.cuda,
                 "total_gpu_memory_GB": torch.cuda.get_device_properties(0).total_memory / (1024**3)
             })
-            
-        if profiler:
-            profiler.end_operation("wandb_init")
     
     try:
         # Load and combine datasets with caching
         print(f"🔄 Loading data for {len(instruments)} instruments")
-        
-        if profiler:
-            profiler.start_operation("data_loading")
         
         # Use fast mode for debugging if needed
         if debug:
@@ -528,10 +518,6 @@ def train_unified_model(
             num_workers=training_params.get('num_workers', 4)
         )
         
-        if profiler:
-            profiler.end_operation("data_loading")
-            profiler.start_operation("model_initialization")
-        
         # Initialize model with torch.compile for 2-3x speedup
         input_dim = len(dataset.feature_columns)
         model = DeribitHybridModel(
@@ -552,10 +538,6 @@ def train_unified_model(
         # Enable W&B model watching for gradient and parameter tracking
         if use_wandb:
             wandb.watch(model, log="all", log_freq=100)
-            
-        if profiler:
-            profiler.end_operation("model_initialization")
-            profiler.start_operation("optimizer_setup")
         
         # Apply mixed precision optimization
         # This alone can give 2-3x speedup
@@ -583,10 +565,6 @@ def train_unified_model(
             anneal_strategy='cos'
         )
         
-        if profiler:
-            profiler.end_operation("optimizer_setup")
-            profiler.start_operation("training")
-        
         # Train with optimized process
         train_optimized(
             model=model,
@@ -602,35 +580,40 @@ def train_unified_model(
             model_save_path=training_params.get('model_save_path', "/mnt/p/perpetual/models/checkpoints"),
             experiment_name="unified_model",
             debug=debug,
-            use_wandb=use_wandb,
-            profiler=profiler  # Pass profiler to train_optimized
+            use_wandb=use_wandb
         )
         
-        if profiler:
-            profiler.end_operation("training")
-    
     finally:
         # Cleanup
         if use_wandb:
-            if profiler:
-                profiler.start_operation("wandb_finish")
             wandb.finish()
-            if profiler:
-                profiler.end_operation("wandb_finish")
             
         # Force garbage collection
-        if profiler:
-            profiler.start_operation("memory_cleanup")
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        if profiler:
-            profiler.end_operation("memory_cleanup")
 
 
 def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scaler, num_epochs=20, device="cuda", patience=5, gradient_accumulation=1, model_save_path="/mnt/p/perpetual/models/checkpoints", experiment_name=None, debug=False, use_wandb=True, profiler=None):
     """
     Optimized training function with mixed precision, gradient accumulation and enhanced monitoring.
+    
+    Args:
+        model: Model to train
+        train_loader: DataLoader for training data
+        val_loader: DataLoader for validation data
+        optimizer: Optimizer for training
+        scheduler: Learning rate scheduler
+        scaler: Gradient scaler for mixed precision training
+        num_epochs: Number of epochs to train for
+        device: Device to train on
+        patience: Number of epochs to wait for improvement before early stopping
+        gradient_accumulation: Number of batches to accumulate gradients over
+        model_save_path: Path to save model checkpoints
+        experiment_name: Name of the experiment for checkpoints
+        debug: Enable debug mode for faster runs
+        use_wandb: Whether to use W&B for tracking
+        profiler: Optional profiler for performance tracking
     """
     print(f"🚀 Starting optimized training on {device} with mixed precision")
     print(f"📊 Using batch size {train_loader.batch_size} × {gradient_accumulation} accumulation steps")
@@ -670,7 +653,6 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
         # Profile epoch time
         if profiler:
             profiler.start_operation(f"epoch_{epoch}")
-            profiler.start_operation(f"epoch_{epoch}_training")
         
         epoch_start_time = time.time()
         
@@ -698,7 +680,7 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
             
             if profiler:
                 profiler.end_operation("data_transfer")
-                profiler.start_operation("forward_pass")
+                profiler.start_operation("forward")
             
             # Get instrument IDs for asset-aware models
             asset_ids = targets.get('instrument_id')
@@ -708,7 +690,7 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
                 outputs = model(features, targets['funding_rate'], asset_ids)
             
             if profiler:
-                profiler.end_operation("forward_pass") 
+                profiler.end_operation("forward") 
                 profiler.start_operation("loss_computation")
             
             with autocast():
@@ -725,13 +707,13 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
             
             if profiler:
                 profiler.end_operation("loss_computation")
-                profiler.start_operation("backward_pass")
+                profiler.start_operation("backward")
             
             # Mixed precision backward pass
             scaler.scale(loss).backward()
             
             if profiler:
-                profiler.end_operation("backward_pass")
+                profiler.end_operation("backward")
             
             # Only update weights after accumulating gradients
             if (batch_idx + 1) % gradient_accumulation == 0:
@@ -773,9 +755,6 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
             
             # Log batch metrics to W&B (but not too frequently)
             if use_wandb and batch_idx % 20 == 0:
-                if profiler:
-                    profiler.start_operation("wandb_batch_logging")
-                    
                 # Calculate GPU memory metrics
                 if torch.cuda.is_available():
                     gpu_memory_allocated = torch.cuda.memory_allocated(0) / (1024**3)
@@ -797,20 +776,16 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
                     'learning_rate': optimizer.param_groups[0]['lr'],
                     'batch': batch_idx + epoch * len(train_loader)
                 })
-                
-                if profiler:
-                    profiler.end_operation("wandb_batch_logging")
         
         # Calculate epoch metrics
         train_loss = np.mean(train_losses)
         train_direction_acc = train_direction_correct / train_direction_total if train_direction_total > 0 else 0
         train_return_mse = train_return_mse_sum / train_direction_total if train_direction_total > 0 else 0
         
-        if profiler:
-            profiler.end_operation(f"epoch_{epoch}_training")
-            profiler.start_operation(f"epoch_{epoch}_validation")
-            
         # ===== VALIDATION =====
+        if profiler:
+            profiler.start_operation("validation")
+            
         model.eval()
         val_losses = []
         val_direction_correct = 0
@@ -847,8 +822,7 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
                 val_return_mse_sum += return_loss.item() * targets['next_return_1bar'].size(0)
         
         if profiler:
-            profiler.end_operation(f"epoch_{epoch}_validation")
-            profiler.start_operation(f"epoch_{epoch}_metrics")
+            profiler.end_operation("validation")
             
         # Calculate epoch metrics
         val_loss = np.mean(val_losses)
@@ -877,9 +851,6 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
         
         # Log to W&B
         if use_wandb:
-            if profiler:
-                profiler.start_operation("wandb_epoch_logging")
-                
             wandb.log({
                 'epoch': epoch + 1,
                 'train_loss': train_loss,
@@ -891,14 +862,11 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
                 'learning_rate': current_lr,
                 'epoch_duration': epoch_duration
             })
-            
-            if profiler:
-                profiler.end_operation("wandb_epoch_logging")
         
         # Add epoch time to profiler
         if profiler:
             profiler.record_epoch_time(epoch_duration)
-            profiler.end_operation(f"epoch_{epoch}_metrics")
+            profiler.end_operation(f"epoch_{epoch}")
             
         # Save if validation loss improved
         if val_loss < best_val_loss:
@@ -942,9 +910,6 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
         
         # Save checkpoint every N epochs to prevent data loss
         if epoch % 5 == 0 or epoch == num_epochs - 1:
-            if profiler:
-                profiler.start_operation("save_checkpoint")
-                
             checkpoint_path = f"{checkpoint_base}_epoch{epoch+1}.pt"
             torch.save({
                 'epoch': epoch,
@@ -954,17 +919,8 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
                 'val_loss': val_loss,
                 'history': history
             }, checkpoint_path)
-            
-            if profiler:
-                profiler.end_operation("save_checkpoint")
-                
-        if profiler:
-            profiler.end_operation(f"epoch_{epoch}")
     
     # Save final model
-    if profiler:
-        profiler.start_operation("save_final_model")
-        
     final_checkpoint_path = f"{checkpoint_base}_final.pt"
     torch.save({
         'epoch': epoch,
@@ -975,16 +931,10 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
         'history': history
     }, final_checkpoint_path)
     
-    if profiler:
-        profiler.end_operation("save_final_model")
-        
     print(f"✅ Training complete! Final model saved to {final_checkpoint_path}")
     
     # Create performance visualizations for W&B
     if use_wandb:
-        if profiler:
-            profiler.start_operation("wandb_create_visualizations")
-            
         # Log final model
         wandb.save(final_checkpoint_path)
         
@@ -1030,9 +980,6 @@ def train_optimized(model, train_loader, val_loader, optimizer, scheduler, scale
             wandb.log({"lr_curve": wandb.Image('/tmp/lr_curve.png')})
         except Exception as e:
             print(f"Error creating plots: {e}")
-            
-        if profiler:
-            profiler.end_operation("wandb_create_visualizations")
     
     return model, history
 
@@ -1092,9 +1039,6 @@ def main():
     use_wandb = not args.no_wandb
     
     # Get list of instruments if not provided
-    if profiler:
-        profiler.start_operation("fetch_instruments")
-        
     if not args.instruments:
         conn = get_connection()
         try:
@@ -1113,15 +1057,9 @@ def main():
             conn.close()
     else:
         instruments = args.instruments
-        
-    if profiler:
-        profiler.end_operation("fetch_instruments")
     
     # Export data to Parquet if requested
     if args.export_parquet:
-        if profiler:
-            profiler.start_operation("export_parquet")
-            
         print("🔄 Exporting instrument data to Parquet format for faster loading")
         
         # Import the export_parquet module
@@ -1137,9 +1075,6 @@ def main():
         except Exception as e:
             print(f"⚠️ Error exporting to Parquet: {e}")
             print("Continuing with database loading")
-            
-        if profiler:
-            profiler.end_operation("export_parquet")
     
     # Adjust for debug mode
     if args.debug:
@@ -1243,7 +1178,7 @@ def main():
         training_params=training_params,
         use_wandb=use_wandb,
         debug=args.debug,
-        profiler=profiler  # Pass the profiler to the training function
+        profiler=profiler
     )
     
     # Save profiling results
