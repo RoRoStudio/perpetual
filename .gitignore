@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pkl
+*.pt
+*.log
+wandb/
+tmp/
+.cache/
+.torch/
+logs/
+*.parquet
