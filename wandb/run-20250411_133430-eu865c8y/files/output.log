@@ -1,0 +1,8 @@
+🔄 Loading data for 1 instruments
+⚡ DEBUG MODE ACTIVE: Using reduced dataset size
+📂 Loading cached data for BTC_USDC-PERPETUAL
+✅ Created dataset with 86593 training and 21626 test samples
+✅ CUDA optimizations enabled for faster training
+🚀 Starting optimized training on cuda with mixed precision
+📊 Using batch size 32 × 2 accumulation steps
+Epoch 1/3 [Train]:  77%|█████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████▎                                          | 2079/2706 [12:10<03:40,  2.84it/s]
