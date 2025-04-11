@@ -731,3 +731,584 @@ class DeribitHybridModel(nn.Module):
                 'correlation_to_portfolio': outputs['correlation_to_portfolio'].squeeze(),
                 'diversification_score': outputs['diversification_score'].squeeze()
             }
+
+
+# OPTIMIZATION: Add optimized causal convolution
+class OptimizedCausalConv1d(nn.Module):
+    """
+    Optimized 1D causal convolution with fused operations for better performance.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, 
+                 dilation: int = 1, **kwargs):
+        super().__init__()
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(
+            in_channels, 
+            out_channels,
+            kernel_size,
+            padding=self.padding,
+            dilation=dilation,
+            **kwargs
+        )
+        # Initialize with better weight distribution for faster convergence
+        nn.init.kaiming_normal_(self.conv.weight, nonlinearity='relu')
+        
+    def forward(self, x):
+        # Use a single fused operation
+        result = self.conv(x)
+        # Slice more efficiently using narrow instead of advanced indexing
+        if self.padding > 0:
+            return torch.narrow(result, 2, 0, result.size(2) - self.padding)
+        return result
+
+
+# OPTIMIZATION: Lightweight Temporal Block with depthwise separable convolution
+class LightweightTemporalBlock(nn.Module):
+    """
+    Optimized temporal block that reduces computation while maintaining expressiveness.
+    """
+    def __init__(self, n_inputs: int, n_outputs: int, kernel_size: int, 
+                 stride: int, dilation: int, dropout: float = 0.2):
+        super().__init__()
+        
+        # Use depthwise separable convolution for efficiency (much faster than standard conv)
+        # First part: depthwise convolution
+        self.depthwise = OptimizedCausalConv1d(
+            n_inputs, n_inputs, kernel_size,
+            stride=stride, dilation=dilation,
+            groups=n_inputs  # Each input channel is convolved separately
+        )
+        
+        # Second part: pointwise convolution (1x1 conv)
+        self.pointwise = nn.Conv1d(n_inputs, n_outputs, 1)
+        
+        # Use a single fused normalization + activation for first block
+        self.bn_act1 = nn.Sequential(
+            nn.BatchNorm1d(n_outputs),
+            nn.SiLU()  # SiLU/Swish is faster on modern GPUs with similar performance to Mish
+        )
+        
+        self.dropout1 = nn.Dropout(dropout)
+        
+        # Use depthwise separable for the second conv too
+        self.depthwise2 = OptimizedCausalConv1d(
+            n_outputs, n_outputs, kernel_size,
+            stride=stride, dilation=dilation,
+            groups=n_outputs
+        )
+        self.pointwise2 = nn.Conv1d(n_outputs, n_outputs, 1)
+        
+        # Fused normalization + activation for second block
+        self.bn_act2 = nn.Sequential(
+            nn.BatchNorm1d(n_outputs),
+            nn.SiLU()
+        )
+        
+        self.dropout2 = nn.Dropout(dropout)
+        
+        # More efficient residual implementation
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        
+    def forward(self, x):
+        # First convolution block (depthwise separable)
+        identity = x
+        
+        # Depthwise + pointwise convolution (separable conv)
+        out = self.depthwise(x)
+        out = self.pointwise(out)
+        
+        # Apply batch norm + activation as a single fused operation
+        out = self.bn_act1(out)
+        out = self.dropout1(out)
+        
+        # Second convolution block (depthwise separable)
+        out = self.depthwise2(out)
+        out = self.pointwise2(out)
+        out = self.bn_act2(out)
+        out = self.dropout2(out)
+        
+        # Residual connection
+        if self.downsample is not None:
+            identity = self.downsample(identity)
+            
+        # Faster inplace addition
+        out.add_(identity)
+        
+        return out
+
+
+# OPTIMIZATION: Optimized Temporal Network
+class OptimizedTemporalConvNet(nn.Module):
+    """
+    Optimized Temporal Convolutional Network with much better performance.
+    """
+    def __init__(self, num_inputs: int, num_channels: List[int], 
+                 kernel_size: int = 3, dropout: float = 0.2):
+        super().__init__()
+        layers = []
+        num_levels = len(num_channels)
+        
+        # Create optimized network
+        for i in range(num_levels):
+            dilation = 2 ** i
+            in_channels = num_inputs if i == 0 else num_channels[i-1]
+            out_channels = num_channels[i]
+            
+            layers.append(
+                LightweightTemporalBlock(
+                    in_channels, out_channels, kernel_size, 
+                    stride=1, dilation=dilation, dropout=dropout
+                )
+            )
+            
+        self.network = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        # Transpose to [batch, channels, seq_len] for convolution
+        x = x.transpose(1, 2).contiguous()  # Add contiguous for better memory layout
+        
+        # Apply faster numerical stabilization
+        x = torch.clamp(x, min=-10.0, max=10.0)
+        
+        out = self.network(x)
+        # Transpose back to [batch, seq_len, channels]
+        return out.transpose(1, 2).contiguous()  # Make contiguous again for better performance
+
+
+# OPTIMIZATION: LightweightAttention - much faster than full transformer
+class LightweightAttention(nn.Module):
+    """
+    Lightweight attention mechanism that's much faster than full transformer.
+    """
+    def __init__(self, embed_dim: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        
+        # Use linear attention approximation (much faster)
+        self.query = nn.Linear(embed_dim, embed_dim)
+        self.key = nn.Linear(embed_dim, embed_dim)
+        self.value = nn.Linear(embed_dim, embed_dim)
+        
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        
+    def forward(self, x, mask=None):
+        """
+        Linear attention implementation - O(n) instead of O(n²)
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # Project queries, keys, values
+        q = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Apply ELU for positive key/query mapping (from "Transformers are RNNs" paper)
+        q = torch.nn.functional.elu(q) + 1.0
+        k = torch.nn.functional.elu(k) + 1.0
+        
+        # Apply linear attention: O(n) complexity instead of O(n²)
+        kv = torch.matmul(k.transpose(-2, -1), v)  # (batch, head, head_dim, head_dim)
+        out = torch.matmul(q, kv)  # (batch, head, seq_len, head_dim)
+        
+        # Reshape back
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        
+        # Final projection
+        out = self.dropout(self.out_proj(out))
+        
+        return out
+
+
+# OPTIMIZATION: Lightweight Encoder Layer - faster than transformer
+class LightweightEncoderLayer(nn.Module):
+    """
+    Lightweight encoder layer that's much faster than full transformer.
+    """
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 512, dropout: float = 0.1):
+        super().__init__()
+        
+        # Lightweight attention
+        self.attention = LightweightAttention(d_model, nhead, dropout)
+        
+        # Use GEGLU for faster convergence in feed-forward network
+        self.ff_linear1 = nn.Linear(d_model, dim_feedforward * 2)
+        self.ff_linear2 = nn.Linear(dim_feedforward, d_model)
+        
+        # Use layer normalization
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        # Pre-norm architecture (more stable)
+        residual = x
+        x = self.norm1(x)
+        x = residual + self.attention(x)
+        
+        # Feed-forward with GEGLU activation
+        residual = x
+        x = self.norm2(x)
+        x_ff = self.ff_linear1(x)
+        
+        # Split and apply GELU to one half
+        x_gelu, x_linear = x_ff.chunk(2, dim=-1)
+        x_gelu = torch.nn.functional.gelu(x_gelu)
+        x_ff = x_gelu * x_linear
+        
+        x_ff = self.ff_linear2(x_ff)
+        x = residual + self.dropout(x_ff)
+        
+        return x
+
+
+# OPTIMIZATION: LightweightTransformer - uses above optimizations
+class LightweightTransformer(nn.Module):
+    """
+    Lightweight transformer that's much faster than the original.
+    """
+    def __init__(self, d_model: int, nhead: int = 8, num_layers: int = 4, 
+                 dim_feedforward: int = 512, dropout: float = 0.1, 
+                 max_seq_length: int = 6000):
+        super().__init__()
+        
+        # Simpler positional encoding
+        self.register_buffer('pe', self._build_positional_encoding(max_seq_length, d_model))
+        self.dropout = nn.Dropout(dropout)
+        
+        # Encoder layers
+        self.layers = nn.ModuleList([
+            LightweightEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout
+            ) for _ in range(num_layers)
+        ])
+        
+        self.norm = nn.LayerNorm(d_model)
+        
+    def _build_positional_encoding(self, max_len, d_model):
+        """Build positional encoding more efficiently"""
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * 
+                           (-math.log(10000.0) / d_model))
+        
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # Clamp to avoid extreme values
+        pe = torch.clamp(pe, min=-5.0, max=5.0)
+        
+        return pe.unsqueeze(0)
+        
+    def forward(self, x, asset_ids=None):
+        """
+        Forward pass through the lightweight transformer.
+        
+        Args:
+            x: [batch_size, seq_len, d_model]
+            asset_ids: Ignored in this optimized version
+        """
+        x = x + self.pe[:, :x.size(1), :]
+        x = self.dropout(x)
+        
+        # Apply encoder layers
+        for layer in self.layers:
+            x = layer(x)
+            
+        return self.norm(x)
+
+
+# OPTIMIZATION: Simplified Kelly Head
+class SimplifiedNeuralKellyHead(nn.Module):
+    """
+    Simplified Kelly criterion head for faster training.
+    """
+    def __init__(self, input_dim: int):
+        super().__init__()
+        
+        # Simplified architecture - single step instead of multiple
+        self.shared = nn.Linear(input_dim, 64)
+        self.activation = nn.SiLU()  # Faster than Mish
+        
+        # Position sizing with single layer
+        self.size_head = nn.Sequential(
+            nn.Linear(64, 1),
+            nn.Tanh()  # Range: [-1, 1]
+        )
+        
+        # Funding sensitivity - simpler
+        self.funding_sensitivity = nn.Sequential(
+            nn.Linear(64, 1),
+            nn.Tanh()
+        )
+        
+        # Direct expected return/risk prediction
+        self.expected_return = nn.Linear(64, 1)
+        self.expected_risk = nn.Sequential(
+            nn.Linear(64, 1),
+            nn.Softplus()
+        )
+        
+    def forward(self, x, funding_rate=None):
+        # Shared features
+        shared = self.activation(self.shared(x))
+        
+        # Direct predictions
+        position_size = self.size_head(shared)
+        funding_sens = self.funding_sensitivity(shared)
+        expected_return = self.expected_return(shared)
+        expected_risk = self.expected_risk(shared)
+        
+        # Apply funding adjustment if available
+        if funding_rate is not None:
+            funding_adj = funding_sens * funding_rate
+            funding_adj = torch.clamp(funding_adj, min=-1.0, max=1.0)
+            # Adjust position size with funding
+            position_size = position_size + 0.2 * funding_adj
+            position_size = torch.clamp(position_size, min=-1.0, max=1.0)
+            
+        return {
+            'position_size': position_size,
+            'expected_return': expected_return,
+            'expected_risk': expected_risk,
+            'funding_sensitivity': funding_sens
+        }
+
+
+# OPTIMIZATION: Simplified Portfolio Head
+class SimplifiedPortfolioHead(nn.Module):
+    """
+    Simplified portfolio optimization head for faster training.
+    """
+    def __init__(self, input_dim: int):
+        super().__init__()
+        
+        # Single shared network instead of multiple pathways
+        self.network = nn.Linear(input_dim, 32)
+        self.activation = nn.SiLU()
+        
+        # Single output layer with multiple outputs
+        self.outputs = nn.Linear(32, 4)
+        
+    def forward(self, x):
+        # Compute shared features
+        features = self.activation(self.network(x))
+        
+        # Get all outputs at once
+        all_outputs = self.outputs(features)
+        
+        # Split into different metrics
+        correlation = torch.tanh(all_outputs[:, 0:1])
+        diversification = torch.sigmoid(all_outputs[:, 1:2])
+        beta = all_outputs[:, 2:3]
+        risk_contribution = torch.sigmoid(all_outputs[:, 3:4])
+        
+        return {
+            'correlation_to_portfolio': correlation,
+            'diversification_score': diversification,
+            'portfolio_beta': beta,
+            'risk_contribution': risk_contribution
+        }
+
+
+# OPTIMIZATION: OptimizedDeribitModel - Complete optimized model
+class OptimizedDeribitModel(nn.Module):
+    """
+    Optimized hybrid model for much faster training.
+    """
+    def __init__(
+        self, 
+        input_dim: int,
+        tcn_channels: List[int] = [128, 128, 128, 128],
+        tcn_kernel_size: int = 3,
+        transformer_dim: int = 128,
+        transformer_heads: int = 8,
+        transformer_layers: int = 4,
+        dropout: float = 0.2,
+        max_seq_length: int = 6000
+    ):
+        super().__init__()
+        
+        # Input dimensions
+        self.input_dim = input_dim
+        self.max_seq_length = max_seq_length
+        
+        # Use faster direct projection
+        self.input_projection = nn.Linear(input_dim, tcn_channels[0])
+        self.input_norm = nn.LayerNorm(input_dim)
+        
+        # Optimized TCN
+        self.tcn = OptimizedTemporalConvNet(
+            num_inputs=tcn_channels[0],
+            num_channels=tcn_channels,
+            kernel_size=tcn_kernel_size,
+            dropout=dropout
+        )
+        
+        # TCN output dimension is the last channel size
+        tcn_output_dim = tcn_channels[-1]
+        
+        # Projection from TCN to Transformer with faster initialization
+        self.tcn_to_transformer = nn.Linear(tcn_output_dim, transformer_dim)
+        nn.init.xavier_uniform_(self.tcn_to_transformer.weight, gain=0.5)
+        
+        # Lightweight transformer
+        self.transformer = LightweightTransformer(
+            d_model=transformer_dim,
+            nhead=transformer_heads,
+            num_layers=transformer_layers,
+            dim_feedforward=transformer_dim * 4,
+            dropout=dropout,
+            max_seq_length=max_seq_length
+        )
+        
+        # Feature gating mechanism
+        self.feature_gate = nn.Sequential(
+            nn.Linear(transformer_dim, transformer_dim),
+            nn.Sigmoid()
+        )
+        
+        # Simplified prediction heads
+        # Direction head
+        self.direction_head = nn.Sequential(
+            nn.Linear(transformer_dim, 3)  # Direct classification for speed
+        )
+        
+        # Return head
+        self.return_head = nn.Sequential(
+            nn.Linear(transformer_dim, 1)
+        )
+        
+        # Risk head
+        self.risk_head = nn.Sequential(
+            nn.Linear(transformer_dim, 1),
+            nn.Softplus()
+        )
+        
+        # Position sizing using simplified Kelly criterion
+        self.size_head = SimplifiedNeuralKellyHead(transformer_dim)
+        
+        # Portfolio optimization head
+        self.portfolio_head = SimplifiedPortfolioHead(transformer_dim)
+        
+        # Initialize weights
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize weights with a more stable approach."""
+        for name, p in self.named_parameters():
+            if 'weight' in name and len(p.shape) >= 2:
+                nn.init.xavier_uniform_(p, gain=0.5)
+            elif 'bias' in name:
+                nn.init.zeros_(p)
+        
+    def forward(self, x, funding_rate=None, asset_ids=None):
+        """
+        Forward pass through the optimized model.
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # Input preprocessing
+        x = torch.clamp(x, min=-20.0, max=20.0)
+        x = self.input_norm(x)
+        
+        # Project input features
+        x = self.input_projection(x)
+        
+        # Apply TCN
+        tcn_output = self.tcn(x)
+        
+        # Project to transformer dimension
+        transformer_input = self.tcn_to_transformer(tcn_output)
+               
+        # Apply lightweight transformer
+        transformer_output = self.transformer(transformer_input)
+        
+        # Take the last sequence element for prediction
+        context_vector = transformer_output[:, -1, :]
+        
+        # Apply feature gating
+        gate = self.feature_gate(context_vector)
+        gated_features = context_vector * gate
+        
+        # Apply prediction heads
+        direction_logits = self.direction_head(gated_features)
+        expected_return = self.return_head(gated_features)
+        expected_risk = self.risk_head(gated_features)
+        
+        # Get position sizing 
+        sizing_outputs = self.size_head(gated_features, funding_rate)
+        
+        # Get portfolio optimization metrics
+        portfolio_outputs = self.portfolio_head(gated_features)
+        
+        # Combine all outputs
+        outputs = {
+            'direction_logits': direction_logits,
+            'expected_return': expected_return,
+            'expected_risk': expected_risk,
+            'position_size': sizing_outputs['position_size'],
+            'funding_sensitivity': sizing_outputs['funding_sensitivity']
+        }
+        
+        # Add portfolio metrics
+        outputs.update(portfolio_outputs)
+        
+        return outputs
+    
+    def predict_trade_signal(self, x, funding_rate=None, asset_ids=None, threshold=0.0):
+        """
+        Generate a trade signal from model outputs.
+        
+        Args:
+            x: Input features [batch_size, seq_len, input_dim]
+            funding_rate: Optional funding rate tensor [batch_size, 1]
+            asset_ids: Optional tensor of asset indices
+            threshold: Confidence threshold for taking a position
+            
+        Returns:
+            Dictionary with trade signals
+        """
+        with torch.no_grad():
+            outputs = self.forward(x, funding_rate, asset_ids)
+            
+            # Get direction probabilities
+            direction_probs = F.softmax(outputs['direction_logits'], dim=1)
+            
+            # Get position size (scaled to [-1, 1])
+            position_size = outputs['position_size']
+            
+            # Determine trading action
+            trade_action = torch.argmax(direction_probs, dim=1)  # 0=short, 1=flat, 2=long
+            
+            # Apply confidence threshold
+            confidence = torch.max(direction_probs, dim=1)[0]
+            valid_trades = confidence >= threshold
+            
+            # Create final position size incorporating direction and sizing
+            # Convert 0,1,2 to -1,0,1
+            direction = (trade_action - 1).float()
+            
+            # Final position is direction * size * confidence
+            final_position = direction * torch.abs(position_size.squeeze()) * confidence
+            
+            # Zero out positions that don't meet threshold
+            final_position = torch.where(valid_trades, final_position, torch.zeros_like(final_position))
+            
+            return {
+                'direction': direction,
+                'position_size': final_position,
+                'confidence': confidence,
+                'expected_return': outputs['expected_return'].squeeze(),
+                'expected_risk': outputs['expected_risk'].squeeze(),
+                'risk_contribution': outputs['risk_contribution'].squeeze(),
+                'correlation_to_portfolio': outputs['correlation_to_portfolio'].squeeze(),
+                'diversification_score': outputs['diversification_score'].squeeze()
+            }
