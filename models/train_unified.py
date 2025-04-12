@@ -21,7 +21,6 @@ import random
 import gc
 import pyarrow.parquet as pq
 import json
-import re
 import tempfile
 
 # Add project root to path for imports
@@ -132,7 +131,6 @@ class FastDataset:
                 all_train_asset_ids.append(train_asset_ids)
                 all_test_asset_ids.append(test_asset_ids)
         
-        # FIX: De-indent these lines to be outside the loop
         # Concatenate all data
         train_features = torch.cat(all_train_features) if all_train_features else torch.tensor([])
         train_targets = torch.cat(all_train_targets) if all_train_targets else torch.tensor([])
@@ -463,8 +461,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train Deribit Perpetual Trading Model")
     parser.add_argument("--instruments", type=str, nargs="+", 
                       help="List of instruments to train on")
-    parser.add_argument("--debug", action="store_true", 
-                      help="Enable debug mode for fast testing")
+    parser.add_argument("--quick-test", action="store_true", 
+                      help="Enable quick test mode for fast testing")
     parser.add_argument("--no-wandb", action="store_true", 
                       help="Disable Weights & Biases logging")
     parser.add_argument("--profile", action="store_true", 
@@ -490,10 +488,12 @@ def main():
                 key, value = arg.split("=", 1)
                 key = key[2:]  # Remove leading "--"
                 
-                # Handle max_speed parameter (convert to boolean)
+                # Convert underscores to hyphens for flags
                 if key == "max_speed":
                     max_speed_from_args = value.lower() == "true"
-                    dot_config["max_speed"] = max_speed_from_args
+                    args.max_speed = max_speed_from_args
+                    continue
+                
                 # Handle model parameters
                 elif key.startswith("model_params."):
                     param_name = key.split(".", 1)[1]
@@ -516,14 +516,10 @@ def main():
         
         # Write config to temporary file if we collected parameters
         if dot_config["model_params"] or dot_config["training_params"]:
-            import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
                 json.dump(dot_config, f, indent=2)
                 args.sweep_config = f.name
                 print(f"Created temporary sweep config from dot notation parameters: {args.sweep_config}")
-                # Set max-speed from args if it was provided
-                if "max_speed" in dot_config:
-                    args.max_speed = max_speed_from_args
     
     # Initialize profiler if enabled
     profiler = None
@@ -534,10 +530,37 @@ def main():
     # Use W&B unless explicitly disabled
     use_wandb = not args.no_wandb
     
-    # Default instruments if not provided
+    # Default instruments if not provided - use all available instruments
     if not args.instruments:
-        instruments = ["BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL", "SOL_USDC-PERPETUAL", 
-                     "XRP_USDC-PERPETUAL", "DOGE_USDC-PERPETUAL"]
+        # Get all instruments from the Parquet cache
+        cache_dir = "/mnt/p/perpetual/cache"
+        if os.path.exists(cache_dir):
+            all_instruments = []
+            for filename in os.listdir(cache_dir):
+                if filename.startswith("tier1_") and filename.endswith(".parquet"):
+                    instrument = filename[6:-8]  # Remove "tier1_" and ".parquet"
+                    all_instruments.append(instrument)
+            
+            # If no instruments found in cache, use default list
+            if not all_instruments:
+                all_instruments = ["BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL", "SOL_USDC-PERPETUAL", 
+                           "XRP_USDC-PERPETUAL", "DOGE_USDC-PERPETUAL", "AVAX_USDC-PERPETUAL",
+                           "DOT_USDC-PERPETUAL", "MATIC_USDC-PERPETUAL", "ADA_USDC-PERPETUAL",
+                           "SHIB_USDC-PERPETUAL", "LTC_USDC-PERPETUAL", "LINK_USDC-PERPETUAL",
+                           "ATOM_USDC-PERPETUAL", "UNI_USDC-PERPETUAL", "TRX_USDC-PERPETUAL"]
+        else:
+            # If cache dir doesn't exist, use default list
+            all_instruments = ["BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL", "SOL_USDC-PERPETUAL", 
+                       "XRP_USDC-PERPETUAL", "DOGE_USDC-PERPETUAL", "AVAX_USDC-PERPETUAL",
+                       "DOT_USDC-PERPETUAL", "MATIC_USDC-PERPETUAL", "ADA_USDC-PERPETUAL",
+                       "SHIB_USDC-PERPETUAL", "LTC_USDC-PERPETUAL", "LINK_USDC-PERPETUAL",
+                       "ATOM_USDC-PERPETUAL", "UNI_USDC-PERPETUAL", "TRX_USDC-PERPETUAL"]
+        
+        # For quick-test mode, just use BTC
+        if args.quick_test:
+            instruments = ["BTC_USDC-PERPETUAL"]
+        else:
+            instruments = all_instruments
     else:
         instruments = args.instruments
     
@@ -555,6 +578,11 @@ def main():
             # Extract parameters from sweep config
             model_params = sweep_config.get('model_params', {})
             training_params = sweep_config.get('training_params', {})
+            
+            # Ensure transformer_dim is even (to avoid dimension mismatch error)
+            if 'transformer_dim' in model_params:
+                model_params['transformer_dim'] = model_params['transformer_dim'] + (model_params['transformer_dim'] % 2)
+                
             max_speed = sweep_config.get('max_speed', args.max_speed)
             print(f"Loaded sweep config with {len(model_params)} model parameters and {len(training_params)} training parameters")
         except Exception as e:
@@ -563,8 +591,8 @@ def main():
             # Use defaults for model/training params (set later)
     else:
         max_speed = args.max_speed
-        # Default parameters for debug mode
-        if args.debug:
+        # Default parameters for quick-test mode
+        if args.quick_test:
             model_params = {
                 "tcn_channels": [32, 32],
                 "tcn_kernel_size": 3,
@@ -607,9 +635,6 @@ def main():
                 "gradient_accumulation": 1,
                 "num_workers": 4
             }
-        
-        # Max speed toggle from args
-        max_speed = args.max_speed
     
     # Set device
     device = "cuda" if torch.cuda.is_available() else "cpu"

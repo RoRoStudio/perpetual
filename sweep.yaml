@@ -16,9 +16,7 @@ parameters:
     min: 2
     max: 6
   model_params.transformer_dim:
-    distribution: int_uniform
-    min: 16
-    max: 64
+    values: [16, 32, 48, 64, 80, 96, 128]  # Only even values
   model_params.transformer_heads:
     distribution: int_uniform
     min: 1
@@ -57,4 +55,4 @@ parameters:
     max: 0.0002
   max_speed:
     values: [true, false]
-program: models/run_training.py
+program: models/train_unified.py

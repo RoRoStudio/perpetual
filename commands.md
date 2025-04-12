@@ -1,20 +1,19 @@
 # Before training
 python -m features.export_parquet
 
+
 # With profiler
-python -m models.run_training --quick-test --profile
+python -m models.train_unified.py --quick-test --profile
 
 # Quick test (few minutes)
-python -m models.run_training --quick-test
+python -m models.train_unified.py --quick-test
 
-# Fast mode (1-2 hours, 2 instruments)
-python -m models.run_training --fast
+# Full training (all instruments)
+python -m models.train_unified.py
 
-# Standard mode (3-4 hours, 5 main instruments)
-python -m models.run_training
 
-# Full training (5-7 hours, all instruments)
-python -m models.run_training --full
+# Run backtest
+python -m simulate.backtest --model /mnt/p/perpetual/models/checkpoints/model_20250412_150846_best.pt
 
 
 # Get resources details (bash command)
