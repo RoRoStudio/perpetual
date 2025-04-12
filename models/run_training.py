@@ -3,7 +3,7 @@
 Simple script to run model training with optimal settings.
 This is a convenience wrapper around train_unified.py with optimal default settings.
 """
-
+import os, sys; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Set environment variables for better performance
 import os
 os.environ["OMP_NUM_THREADS"] = str(min(8, os.cpu_count() or 4))
@@ -53,6 +53,7 @@ def main():
                       help="Directory to save model outputs")
     parser.add_argument("--sweep-id", type=str, 
                       help="WandB sweep ID to load parameters from")
+    parser.add_argument("--sweep-config", type=str, help="Path to sweep configuration file or JSON string")
     args = parser.parse_args()
     
     # Initialize profiler

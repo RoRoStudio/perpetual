@@ -21,6 +21,8 @@ import random
 import gc
 import pyarrow.parquet as pq
 import json
+import re
+import tempfile
 
 # Add project root to path for imports
 sys.path.append('/mnt/p/perpetual')
@@ -54,6 +56,9 @@ class FastDataset:
             "direction_class", "next_volatility"
         ]
         
+        # Add this line to create asset ID mapping
+        self.asset_ids = {instrument: i for i, instrument in enumerate(instruments)}
+        
         # Load datasets
         self.train_data, self.test_data = self._load_data()
         
@@ -63,6 +68,9 @@ class FastDataset:
         all_train_targets = []
         all_test_features = []
         all_test_targets = []
+        # NEW: Add lists for asset IDs
+        all_train_asset_ids = []
+        all_test_asset_ids = []
         
         for instrument in self.instruments:
             # Try to load from Parquet (faster)
@@ -77,7 +85,7 @@ class FastDataset:
                 df['next_return_1bar'] = df['return_1bar'].shift(-1)
                 df['next_return_2bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2)
                 df['next_return_4bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2) + \
-                                       df['return_1bar'].shift(-3) + df['return_1bar'].shift(-4)
+                                    df['return_1bar'].shift(-3) + df['return_1bar'].shift(-4)
                 df['next_volatility'] = df['return_1bar'].rolling(4).std().shift(-4)
                 
                 # Fill NaNs
@@ -116,16 +124,29 @@ class FastDataset:
                 all_train_targets.append(train_targets)
                 all_test_features.append(test_features)
                 all_test_targets.append(test_targets)
-            
+                
+                # NEW: Add these lines to create and store asset IDs
+                instrument_id = self.asset_ids.get(instrument, 0)
+                train_asset_ids = torch.full((len(train_features),), instrument_id, dtype=torch.long)
+                test_asset_ids = torch.full((len(test_features),), instrument_id, dtype=torch.long)
+                all_train_asset_ids.append(train_asset_ids)
+                all_test_asset_ids.append(test_asset_ids)
+        
+        # FIX: De-indent these lines to be outside the loop
         # Concatenate all data
         train_features = torch.cat(all_train_features) if all_train_features else torch.tensor([])
         train_targets = torch.cat(all_train_targets) if all_train_targets else torch.tensor([])
         test_features = torch.cat(all_test_features) if all_test_features else torch.tensor([])
         test_targets = torch.cat(all_test_targets) if all_test_targets else torch.tensor([])
         
+        # NEW: Concatenate asset IDs
+        train_asset_ids = torch.cat(all_train_asset_ids) if all_train_asset_ids else torch.tensor([])
+        test_asset_ids = torch.cat(all_test_asset_ids) if all_test_asset_ids else torch.tensor([])
+        
         print(f"✅ Loaded {len(train_features)} training and {len(test_features)} test samples")
         
-        return (train_features, train_targets), (test_features, test_targets)
+        # NEW: Return asset IDs as part of the data tuples
+        return (train_features, train_targets, train_asset_ids), (test_features, test_targets, test_asset_ids)
     
     def _create_sequences(self, features_df, targets_df):
         """Create sequences from DataFrames efficiently"""
@@ -170,8 +191,9 @@ class FastDataset:
         # Use TensorDataset for better performance
         from torch.utils.data import TensorDataset
         
-        train_dataset = TensorDataset(self.train_data[0], self.train_data[1])
-        test_dataset = TensorDataset(self.test_data[0], self.test_data[1])
+        # NEW: Include asset_ids in the datasets
+        train_dataset = TensorDataset(self.train_data[0], self.train_data[1], self.train_data[2])
+        test_dataset = TensorDataset(self.test_data[0], self.test_data[1], self.test_data[2])
         
         # Configure DataLoader with optimal settings
         train_loader = DataLoader(
@@ -239,13 +261,15 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
         
         optimizer.zero_grad()
         
-        for batch_idx, (features, targets) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")):
+        for batch_idx, (features, targets, asset_ids) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")):
             if profiler:
                 profiler.start_operation("batch_processing")
                 
             # Move to device with non_blocking for better performance
             features = features.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
+            # NEW: Move asset_ids to device
+            asset_ids = asset_ids.to(device, non_blocking=True)
             
             # Extract individual targets
             direction_class = targets[:, 3].long() + 1  # Convert -1,0,1 to 0,1,2
@@ -254,10 +278,10 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
             
             # Mixed precision forward pass
             with autocast():
-                # Create dummy funding rate and asset_ids (not used in fast training)
+                # Create funding rate (but use real asset_ids now)
                 funding_rate = torch.zeros(features.size(0), 1, device=device)
-                asset_ids = None
                 
+                # NEW: Use asset_ids instead of None
                 outputs = model(features, funding_rate, asset_ids)
                 
                 # Compute losses
@@ -318,21 +342,22 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
         val_direction_total = 0
         
         with torch.no_grad():
-            for features, targets in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
+            for features, targets, asset_ids in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
                 # Move to device
                 features = features.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
+                # NEW: Move asset_ids to device
+                asset_ids = asset_ids.to(device, non_blocking=True)
                 
                 # Extract targets
                 direction_class = targets[:, 3].long() + 1  # Convert -1,0,1 to 0,1,2
                 next_return = targets[:, 0].unsqueeze(1)
                 next_volatility = targets[:, 4].unsqueeze(1)
                 
-                # Create dummy inputs
+                # Create funding rate
                 funding_rate = torch.zeros(features.size(0), 1, device=device)
-                asset_ids = None
                 
-                # Mixed precision inference
+                # NEW: Use asset_ids instead of None
                 with autocast():
                     outputs = model(features, funding_rate, asset_ids)
                     
@@ -437,20 +462,68 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Train Deribit Perpetual Trading Model")
     parser.add_argument("--instruments", type=str, nargs="+", 
-                        help="List of instruments to train on")
+                      help="List of instruments to train on")
     parser.add_argument("--debug", action="store_true", 
-                        help="Enable debug mode for fast testing")
+                      help="Enable debug mode for fast testing")
     parser.add_argument("--no-wandb", action="store_true", 
-                        help="Disable Weights & Biases logging")
+                      help="Disable Weights & Biases logging")
     parser.add_argument("--profile", action="store_true", 
-                        help="Enable detailed performance profiling")
+                      help="Enable detailed performance profiling")
     parser.add_argument("--max-speed", action="store_true", 
-                        help="Enable all speed optimizations")
+                      help="Enable all speed optimizations")
     parser.add_argument("--output-dir", type=str, default="/mnt/p/perpetual/models/checkpoints",
-                        help="Directory to save output models")
+                      help="Directory to save output models")
     parser.add_argument("--sweep-config", type=str, 
-                        help="Path to sweep configuration file")
-    args = parser.parse_args()
+                      help="Path to sweep configuration file or JSON string")
+    
+    # Parse known args and capture unknown args (for dot notation parameters)
+    args, unknown = parser.parse_known_args()
+    
+    # Process dot notation parameters from wandb sweep
+    if unknown:
+        # Create config structure for sweep parameters
+        dot_config = {"model_params": {}, "training_params": {}}
+        max_speed_from_args = False
+        
+        for arg in unknown:
+            if "=" in arg and arg.startswith("--"):
+                key, value = arg.split("=", 1)
+                key = key[2:]  # Remove leading "--"
+                
+                # Handle max_speed parameter (convert to boolean)
+                if key == "max_speed":
+                    max_speed_from_args = value.lower() == "true"
+                    dot_config["max_speed"] = max_speed_from_args
+                # Handle model parameters
+                elif key.startswith("model_params."):
+                    param_name = key.split(".", 1)[1]
+                    # Convert to appropriate types
+                    if param_name in ["transformer_dim", "transformer_heads", 
+                                     "transformer_layers", "max_seq_length", 
+                                     "tcn_kernel_size"]:
+                        dot_config["model_params"][param_name] = int(float(value))
+                    else:
+                        dot_config["model_params"][param_name] = float(value)
+                # Handle training parameters
+                elif key.startswith("training_params."):
+                    param_name = key.split(".", 1)[1]
+                    # Convert to appropriate types
+                    if param_name in ["batch_size", "gradient_accumulation", 
+                                     "num_epochs", "patience", "seq_length"]:
+                        dot_config["training_params"][param_name] = int(float(value))
+                    else:
+                        dot_config["training_params"][param_name] = float(value)
+        
+        # Write config to temporary file if we collected parameters
+        if dot_config["model_params"] or dot_config["training_params"]:
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                json.dump(dot_config, f, indent=2)
+                args.sweep_config = f.name
+                print(f"Created temporary sweep config from dot notation parameters: {args.sweep_config}")
+                # Set max-speed from args if it was provided
+                if "max_speed" in dot_config:
+                    args.max_speed = max_speed_from_args
     
     # Initialize profiler if enabled
     profiler = None
@@ -463,20 +536,33 @@ def main():
     
     # Default instruments if not provided
     if not args.instruments:
-        instruments = ["BTC_USDC-PERPETUAL"]
+        instruments = ["BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL", "SOL_USDC-PERPETUAL", 
+                     "XRP_USDC-PERPETUAL", "DOGE_USDC-PERPETUAL"]
     else:
         instruments = args.instruments
     
     # Load parameters from sweep config if provided
     if args.sweep_config:
-        with open(args.sweep_config, 'r') as f:
-            sweep_config = json.load(f)
-        
-        # Extract parameters from sweep config
-        model_params = sweep_config.get('model_params', {})
-        training_params = sweep_config.get('training_params', {})
-        max_speed = sweep_config.get('max_speed', args.max_speed)
+        try:
+            # Check if it's a file path or a JSON string
+            if os.path.isfile(args.sweep_config):
+                with open(args.sweep_config, 'r') as f:
+                    sweep_config = json.load(f)
+            else:
+                # Try to parse as JSON string
+                sweep_config = json.loads(args.sweep_config)
+            
+            # Extract parameters from sweep config
+            model_params = sweep_config.get('model_params', {})
+            training_params = sweep_config.get('training_params', {})
+            max_speed = sweep_config.get('max_speed', args.max_speed)
+            print(f"Loaded sweep config with {len(model_params)} model parameters and {len(training_params)} training parameters")
+        except Exception as e:
+            print(f"Error parsing sweep config: {e}, using defaults")
+            max_speed = args.max_speed
+            # Use defaults for model/training params (set later)
     else:
+        max_speed = args.max_speed
         # Default parameters for debug mode
         if args.debug:
             model_params = {
@@ -618,6 +704,13 @@ def main():
         profiler=profiler,
         use_wandb=use_wandb
     )
+    
+    # Clean up temporary config file if we created one
+    if unknown and 'tempfile' in locals() and os.path.exists(args.sweep_config):
+        try:
+            os.unlink(args.sweep_config)
+        except:
+            pass
     
     # Save profiling results
     if profiler:

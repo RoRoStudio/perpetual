@@ -2,70 +2,59 @@ method: bayes
 metric:
   goal: maximize
   name: val_direction_acc
-
 parameters:
-  device:
-    values: [cuda]
-
+  model_params.dropout:
+    distribution: uniform
+    min: 0.0
+    max: 0.4
+  model_params.max_seq_length:
+    distribution: int_uniform
+    min: 256
+    max: 1024
+  model_params.tcn_kernel_size:
+    distribution: int_uniform
+    min: 2
+    max: 6
+  model_params.transformer_dim:
+    distribution: int_uniform
+    min: 16
+    max: 64
+  model_params.transformer_heads:
+    distribution: int_uniform
+    min: 1
+    max: 4
+  model_params.transformer_layers:
+    distribution: int_uniform
+    min: 1
+    max: 4
+  training_params.batch_size:
+    distribution: int_uniform
+    min: 16
+    max: 64
+  training_params.gradient_accumulation:
+    distribution: int_uniform
+    min: 1
+    max: 4
+  training_params.learning_rate:
+    distribution: uniform
+    min: 0.0005
+    max: 0.002
+  training_params.num_epochs:
+    distribution: int_uniform
+    min: 2
+    max: 6
+  training_params.patience:
+    distribution: int_uniform
+    min: 2
+    max: 6
+  training_params.seq_length:
+    distribution: int_uniform
+    min: 16
+    max: 64
+  training_params.weight_decay:
+    distribution: uniform
+    min: 5e-05
+    max: 0.0002
   max_speed:
     values: [true, false]
-
-  model_params:
-    parameters:
-      dropout:
-        distribution: uniform
-        min: 0.0
-        max: 0.4
-      max_seq_length:
-        distribution: int_uniform
-        min: 256
-        max: 1024
-      tcn_kernel_size:
-        distribution: int_uniform
-        min: 2
-        max: 6
-      transformer_dim:
-        distribution: int_uniform
-        min: 16
-        max: 64
-      transformer_heads:
-        distribution: int_uniform
-        min: 1
-        max: 4
-      transformer_layers:
-        distribution: int_uniform
-        min: 1
-        max: 4
-
-  training_params:
-    parameters:
-      batch_size:
-        distribution: int_uniform
-        min: 16
-        max: 64
-      gradient_accumulation:
-        distribution: int_uniform
-        min: 1
-        max: 4
-      learning_rate:
-        distribution: uniform
-        min: 0.0005
-        max: 0.002
-      num_epochs:
-        distribution: int_uniform
-        min: 2
-        max: 6
-      patience:
-        distribution: int_uniform
-        min: 2
-        max: 6
-      seq_length:
-        distribution: int_uniform
-        min: 16
-        max: 64
-      weight_decay:
-        distribution: uniform
-        min: 5e-05
-        max: 0.0002
-
-program: models/train_unified.py
+program: models/run_training.py
