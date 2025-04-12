@@ -4,76 +4,102 @@ Simple script to run model training with optimal settings.
 This is a convenience wrapper around train_unified.py with optimal default settings.
 """
 
-# OPTIMIZATION: Set PyTorch and NumPy thread settings BEFORE importing other modules
+# Set environment variables for better performance
 import os
 os.environ["OMP_NUM_THREADS"] = str(min(8, os.cpu_count() or 4))
 os.environ["MKL_NUM_THREADS"] = str(min(8, os.cpu_count() or 4))
-os.environ["NUMEXPR_NUM_THREADS"] = str(min(8, os.cpu_count() or 4))
-
-# OPTIMIZATION: Set PyTorch environment variables
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
-# Regular imports
 import subprocess
 import argparse
 import time
 from datetime import datetime
 import torch
-import numpy as np
-import random
+import json
 from models.profiler import TrainingProfiler
 
+def apply_performance_optimizations():
+    """Apply performance optimizations for better speed"""
+    if torch.cuda.is_available():
+        # Enable TF32 precision for faster math on Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Enable cuDNN benchmarking
+        torch.backends.cudnn.benchmark = True
+        
+        # Faster but potentially less reproducible
+        torch.backends.cudnn.deterministic = False
+        
+        # Clear GPU cache
+        torch.cuda.empty_cache()
+        
+        print(f"🖥️ CUDA optimizations applied for {torch.cuda.get_device_name(0)}")
+    else:
+        print("⚠️ CUDA not available, using CPU only")
+
 def main():
-    # Configure argument parser with additional optimization options
     parser = argparse.ArgumentParser(description="Run Deribit model training with optimal settings")
-    parser.add_argument("--fast", action="store_true", help="Run in fast mode (one instrument, few epochs)")
-    parser.add_argument("--quick-test", action="store_true", help="Run in quick test mode (minimal training to verify setup)")
-    parser.add_argument("--full", action="store_true", help="Run full training on all instruments")
-    parser.add_argument("--profile", action="store_true", help="Enable detailed performance profiling")
-    parser.add_argument("--max-speed", action="store_true", help="Enable all speed optimizations (may reduce accuracy slightly)")
-    parser.add_argument("--output-dir", type=str, default="/mnt/p/perpetual/models/checkpoints",
-                        help="Directory to save output models")
-    parser.add_argument("--cache-dir", type=str, default="/tmp/deribit_cache", 
-                        help="Directory to cache processed data")
+    parser.add_argument("--fast", action="store_true", 
+                      help="Run in fast mode (one instrument, few epochs)")
+    parser.add_argument("--quick-test", action="store_true", 
+                      help="Run in quick test mode (minimal training)")
+    parser.add_argument("--profile", action="store_true", 
+                      help="Enable detailed performance profiling")
+    parser.add_argument("--max-speed", action="store_true", 
+                      help="Enable all speed optimizations")
+    parser.add_argument("--output-dir", type=str, 
+                      default="/mnt/p/perpetual/models/checkpoints",
+                      help="Directory to save model outputs")
+    parser.add_argument("--sweep-id", type=str, 
+                      help="WandB sweep ID to load parameters from")
     args = parser.parse_args()
     
-    # Initialize profiler if enabled
+    # Initialize profiler
     profiler = None
     if args.profile:
         profiler = TrainingProfiler("/mnt/p/perpetual/tmp")
         print("🔍 Performance profiling enabled")
     
-    # Determine run mode
+    # Determine instruments based on mode
     if args.quick_test:
         mode = "quick-test"
-        cmd = ["python", "-m", "models.train_unified", "--debug", "--instruments", "BTC_USDC-PERPETUAL"]
+        instruments = ["BTC_USDC-PERPETUAL"]
     elif args.fast:
         mode = "fast"
-        cmd = ["python", "-m", "models.train_unified", "--instruments", "BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL"]
-    elif args.full:
-        mode = "full"
-        cmd = ["python", "-m", "models.train_unified"]  # Train on all instruments
+        instruments = ["BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL"]
     else:
-        # Default to standard mode with main instruments
         mode = "standard"
-        cmd = ["python", "-m", "models.train_unified", "--instruments", 
-               "BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL", "SOL_USDC-PERPETUAL", 
-               "XRP_USDC-PERPETUAL", "DOGE_USDC-PERPETUAL"]
+        instruments = ["BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL", 
+                     "SOL_USDC-PERPETUAL", "XRP_USDC-PERPETUAL", "DOGE_USDC-PERPETUAL"]
     
-    # Add flags based on arguments
+    # Build command
+    cmd = ["python", "-m", "models.train_unified"]
+    
+    # Add instruments
+    cmd.extend(["--instruments"] + instruments)
+    
+    # Add debug mode for quick test
+    if args.quick_test:
+        cmd.append("--debug")
+    
+    # Add profile flag
     if args.profile:
         cmd.append("--profile")
-        print("🔍 Performance profiling enabled")
-        
+    
+    # Add max-speed flag
     if args.max_speed:
         cmd.append("--max-speed")
-        print("⚡ Maximum speed optimizations enabled")
     
-    # Add output directory 
+    # Add output directory
     cmd.extend(["--output-dir", args.output_dir])
     
-    # Add cache directory
-    cmd.extend(["--cache-dir", args.cache_dir])
+    # Add sweep config if provided
+    if args.sweep_id:
+        # Create temporary sweep config file
+        sweep_config = create_sweep_config(args.sweep_id)
+        if sweep_config:
+            cmd.extend(["--sweep-config", sweep_config])
     
     # Print run information
     print("\n" + "="*50)
@@ -82,11 +108,11 @@ def main():
     print(f"Command: {' '.join(cmd)}")
     print("="*50 + "\n")
     
-    # Record start time
-    start_time = time.time()
-    
     # Apply performance optimizations
     apply_performance_optimizations()
+    
+    # Record start time
+    start_time = time.time()
     
     # Run the command
     try:
@@ -114,49 +140,48 @@ def main():
     else:
         print("❌ Model training failed. Check logs for details.")
 
-def apply_performance_optimizations():
-    """Apply various performance optimizations for better training speed."""
-    # Configure NumPy for better performance
-    np.set_printoptions(precision=4, suppress=True)
-    
-    # Set random seeds for deterministic results
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
-    
-    # Configure PyTorch for better performance
-    if torch.cuda.is_available():
-        # Enable TF32 precision for better performance on Ampere+ GPUs
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+def create_sweep_config(sweep_id):
+    """
+    Create a temporary config file from wandb sweep parameters.
+    Returns the path to the config file or None if failed.
+    """
+    try:
+        import wandb
+        api = wandb.Api()
+        sweep = api.sweep(f"robertfreericks-roro-studio/deribit-perpetual-model/{sweep_id}")
         
-        # Set memory allocator for better performance
-        try:
-            torch.cuda.memory.set_per_process_memory_fraction(0.95)
-        except:
-            # Fall back if this specific API is not available
-            pass
+        # Extract best configuration
+        best_run = None
+        best_metric = float('inf')
         
-        # Set CUDA options
-        torch.cuda.manual_seed_all(42)
-        torch.cuda.empty_cache()
+        for run in sweep.runs:
+            if run.state == "finished":
+                metric_value = run.summary.get("Relative Time (Process)", float('inf'))
+                if metric_value < best_metric:
+                    best_metric = metric_value
+                    best_run = run
         
-        # Use cudnn benchmarking to find the best algorithm
-        torch.backends.cudnn.benchmark = True
-        
-        # For maximum speed on consumer GPUs, disable deterministic algorithms
-        # This can slightly affect result reproducibility but improves speed
-        torch.backends.cudnn.deterministic = False
-        
-        # Print CUDA information
-        print(f"🖥️ Using CUDA: {torch.version.cuda}")
-        print(f"🖥️ Device: {torch.cuda.get_device_name(0)}")
-        print(f"🖥️ Memory: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.1f} GB")
-    else:
-        print("⚠️ CUDA not available, using CPU only. This will be significantly slower.")
-        # Optimize OpenMP operations for CPU training
-        os.environ["OMP_SCHEDULE"] = "STATIC"
-        os.environ["OMP_PROC_BIND"] = "CLOSE"
+        if best_run:
+            # Extract config from best run
+            config = {
+                "model_params": best_run.config.get("model_params", {}),
+                "training_params": best_run.config.get("training_params", {}),
+                "max_speed": best_run.config.get("max_speed", "true") == "true"
+            }
+            
+            # Save to temporary file
+            config_path = "/tmp/sweep_config.json"
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+                
+            print(f"✅ Created sweep config from best run in sweep {sweep_id}")
+            return config_path
+        else:
+            print(f"⚠️ No finished runs found in sweep {sweep_id}")
+            return None
+    except Exception as e:
+        print(f"⚠️ Error creating sweep config: {e}")
+        return None
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,71 @@
+method: bayes
+metric:
+  goal: maximize
+  name: val_direction_acc
+
+parameters:
+  device:
+    values: [cuda]
+
+  max_speed:
+    values: [true, false]
+
+  model_params:
+    parameters:
+      dropout:
+        distribution: uniform
+        min: 0.0
+        max: 0.4
+      max_seq_length:
+        distribution: int_uniform
+        min: 256
+        max: 1024
+      tcn_kernel_size:
+        distribution: int_uniform
+        min: 2
+        max: 6
+      transformer_dim:
+        distribution: int_uniform
+        min: 16
+        max: 64
+      transformer_heads:
+        distribution: int_uniform
+        min: 1
+        max: 4
+      transformer_layers:
+        distribution: int_uniform
+        min: 1
+        max: 4
+
+  training_params:
+    parameters:
+      batch_size:
+        distribution: int_uniform
+        min: 16
+        max: 64
+      gradient_accumulation:
+        distribution: int_uniform
+        min: 1
+        max: 4
+      learning_rate:
+        distribution: uniform
+        min: 0.0005
+        max: 0.002
+      num_epochs:
+        distribution: int_uniform
+        min: 2
+        max: 6
+      patience:
+        distribution: int_uniform
+        min: 2
+        max: 6
+      seq_length:
+        distribution: int_uniform
+        min: 16
+        max: 64
+      weight_decay:
+        distribution: uniform
+        min: 5e-05
+        max: 0.0002
+
+program: models/train_unified.py
