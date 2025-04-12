@@ -219,7 +219,9 @@ class FastDataset:
 
 def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device, 
           num_epochs=1, patience=3, gradient_accumulation=1, model_save_path="./models", 
-          profiler=None, use_wandb=True):
+          profiler=None, use_wandb=True,
+          max_speed=False, instruments=None, model_params=None, training_params=None):
+
     """
     Simplified training function with essential optimizations
     """
@@ -410,7 +412,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            
+
             # Save best model
             checkpoint_path = f"{checkpoint_base}_best.pt"
             torch.save({
@@ -419,7 +421,16 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
             }, checkpoint_path)
-            
+
+            # Save JSON sidecar
+            with open(checkpoint_base + "_best.json", "w") as f:
+                json.dump({
+                    "model_type": "OptimizedDeribitModel" if max_speed else "DeribitHybridModel",
+                    "instruments": instruments,
+                    "model_params": model_params,
+                    "training_params": training_params
+                }, f, indent=2)
+
             print(f"✅ Model improved! Saved to {checkpoint_path}")
             
             # Save to W&B
@@ -727,9 +738,13 @@ def main():
         gradient_accumulation=training_params.get('gradient_accumulation', 1),
         model_save_path=args.output_dir,
         profiler=profiler,
-        use_wandb=use_wandb
+        use_wandb=use_wandb,
+        max_speed=max_speed,
+        instruments=instruments,
+        model_params=model_params,
+        training_params=training_params
     )
-    
+
     # Clean up temporary config file if we created one
     if unknown and 'tempfile' in locals() and os.path.exists(args.sweep_config):
         try:

@@ -1,35 +1,36 @@
-#!/usr/bin/env python3
-"""
-Backtest Deribit model on validation set and log metrics to W&B.
-"""
-import os
-import sys
 import argparse
+import os
+import json
 import torch
+import wandb
 import numpy as np
 from tqdm import tqdm
-from datetime import datetime
-import wandb
-
-sys.path.append('/mnt/p/perpetual')
+from torch.utils.data import TensorDataset, DataLoader
 
 from models.architecture import DeribitHybridModel, OptimizedDeribitModel
 from features.transformers import FeatureTransformer
-from torch.utils.data import DataLoader, TensorDataset
 import pyarrow.parquet as pq
 
-def load_data(instruments, seq_length=64, test_size=0.2):
-    all_features, all_targets, all_asset_ids = [], [], []
-    asset_ids = {name: idx for idx, name in enumerate(instruments)}
+def load_sidecar_config(checkpoint_path):
+    """Try to find a sidecar .json config with the same base name as the checkpoint"""
+    config_path = checkpoint_path.replace(".pt", ".json")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            return json.load(f)
+    return {}
 
-    for name in instruments:
-        path = f"/mnt/p/perpetual/cache/tier1_{name}.parquet"
-        if not os.path.exists(path):
-            continue
-        print(f"📥 Loading {name}")
-        df = pq.read_table(path, memory_map=True).to_pandas()
+def load_dataset(instruments, seq_length):
+    all_features = []
+    all_targets = []
+    all_asset_ids = []
+    asset_map = {inst: idx for idx, inst in enumerate(instruments)}
+    feature_columns = None
 
-        # Compute labels
+    for instrument in instruments:
+        path = f"/mnt/p/perpetual/cache/tier1_{instrument}.parquet"
+        table = pq.read_table(path, memory_map=True)
+        df = table.to_pandas()
+
         df['next_return_1bar'] = df['return_1bar'].shift(-1)
         df['next_return_2bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2)
         df['next_return_4bar'] = sum(df['return_1bar'].shift(-i) for i in range(1, 5))
@@ -38,114 +39,121 @@ def load_data(instruments, seq_length=64, test_size=0.2):
         df['direction_class'] = 0
         df.loc[df['next_return_1bar'] > 0.5 * volatility, 'direction_class'] = 1
         df.loc[df['next_return_1bar'] < -0.5 * volatility, 'direction_class'] = -1
+
         for col in ['next_return_1bar', 'next_return_2bar', 'next_return_4bar', 'next_volatility']:
             df[col].fillna(0, inplace=True)
 
-        # Features and targets
-        label_cols = ['next_return_1bar', 'next_return_2bar', 'next_return_4bar', 'direction_class', 'next_volatility']
-        exclude_cols = label_cols + ['timestamp', 'instrument_name']
-        feature_cols = [col for col in df.columns if col not in exclude_cols]
+        label_cols = ["next_return_1bar", "next_return_2bar", "next_return_4bar", "direction_class", "next_volatility"]
 
-        transformer = FeatureTransformer(name)
-        X = transformer.transform(df[feature_cols]).values.astype(np.float32)
-        y = df[label_cols].values.astype(np.float32)
+        if feature_columns is None:
+            exclude = label_cols + ['instrument_name', 'timestamp']
+            feature_columns = [col for col in df.columns if col not in exclude]
 
-        N = len(X) - seq_length + 1
-        split = int(N * (1 - test_size))
-        X_val = np.stack([X[i:i+seq_length] for i in range(split, N)])
-        y_val = y[split + seq_length - 1:N + seq_length - 1]
-        asset_id_val = np.full((len(X_val),), asset_ids[name], dtype=np.int64)
+        transformer = FeatureTransformer(instrument)
+        features_df = transformer.transform(df[feature_columns])
+        targets_df = df[label_cols]
 
-        all_features.append(torch.tensor(X_val))
-        all_targets.append(torch.tensor(y_val))
-        all_asset_ids.append(torch.tensor(asset_id_val))
+        features_np = features_df.values.astype(np.float32)
+        targets_np = targets_df.values.astype(np.float32)
 
-    return (
-        torch.cat(all_features),
-        torch.cat(all_targets),
-        torch.cat(all_asset_ids),
-        asset_ids
+        num_seqs = len(features_np) - seq_length + 1
+        feat_seq = torch.zeros((num_seqs, seq_length, features_np.shape[1]))
+        targ_seq = torch.zeros((num_seqs, targets_np.shape[1]))
+        ids_seq = torch.full((num_seqs,), asset_map[instrument], dtype=torch.long)
+
+        for i in range(num_seqs):
+            feat_seq[i] = torch.tensor(features_np[i:i + seq_length])
+            targ_seq[i] = torch.tensor(targets_np[i + seq_length - 1])
+
+        all_features.append(feat_seq)
+        all_targets.append(targ_seq)
+        all_asset_ids.append(ids_seq)
+
+    X = torch.cat(all_features)
+    y = torch.cat(all_targets)
+    ids = torch.cat(all_asset_ids)
+    return TensorDataset(X, y, ids)
+
+def run_backtest(checkpoint_path):
+    print(f"🔍 Loading checkpoint from {checkpoint_path}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Load checkpoint and sidecar config
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    config = load_sidecar_config(checkpoint_path)
+    model_type = config.get("model_type", "OptimizedDeribitModel")
+    instruments = config.get("instruments", [])
+    model_params = config.get("model_params", {})
+    training_params = config.get("training_params", {})
+    seq_length = training_params.get("seq_length", 32)
+    input_dim = model_params.get("input_dim", 43)  # default
+
+    # Load test dataset
+    dataset = load_dataset(instruments, seq_length)
+    loader = DataLoader(dataset, batch_size=64, shuffle=False)
+
+    # Init model
+    if model_type == "DeribitHybridModel":
+        model = DeribitHybridModel(input_dim=input_dim, **model_params).to(device)
+    else:
+        model = OptimizedDeribitModel(input_dim=input_dim, **model_params).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    # Log W&B
+    wandb.init(
+        project="deribit-perpetual-model",
+        name=f"backtest_{os.path.basename(checkpoint_path)}",
+        config={
+            "model_path": checkpoint_path,
+            "model_type": model_type,
+            "instruments": instruments,
+            "seq_length": seq_length
+        }
     )
 
-@torch.no_grad()
-def evaluate(model, val_loader, device, asset_ids):
-    model.eval()
     criterion = torch.nn.CrossEntropyLoss()
-    all_correct, all_total = 0, 0
-    instrument_acc = {name: [0, 0] for name in asset_ids}
+    all_preds = []
+    all_labels = []
+    instrument_metrics = {inst: {"correct": 0, "total": 0} for inst in instruments}
 
-    for X, y, aid in tqdm(val_loader, desc="📊 Running backtest"):
-        X, y, aid = X.to(device), y.to(device), aid.to(device)
-        direction_true = y[:, 3].long() + 1  # Shift -1,0,1 -> 0,1,2
-        direction_pred = torch.argmax(model(X, torch.zeros(len(X), 1).to(device), aid)['direction_logits'], dim=1)
+    with torch.no_grad():
+        for x, y, ids in tqdm(loader):
+            x, y, ids = x.to(device), y.to(device), ids.to(device)
+            funding_rate = torch.zeros((x.shape[0], 1), device=device)
+            output = model(x, funding_rate, ids)
+            logits = output["direction_logits"]
+            preds = torch.argmax(logits, dim=1)
+            labels = y[:, 3].long() + 1
 
-        correct = (direction_true == direction_pred).sum().item()
-        total = direction_true.size(0)
+            for i, inst_id in enumerate(ids):
+                name = instruments[inst_id.item()]
+                instrument_metrics[name]["total"] += 1
+                if preds[i] == labels[i]:
+                    instrument_metrics[name]["correct"] += 1
 
-        all_correct += correct
-        all_total += total
+            all_preds.append(preds.cpu())
+            all_labels.append(labels.cpu())
 
-        for idx, a in enumerate(aid.cpu().numpy()):
-            name = list(asset_ids.keys())[list(asset_ids.values()).index(a)]
-            instrument_acc[name][0] += int(direction_true[idx].item() == direction_pred[idx].item())
-            instrument_acc[name][1] += 1
+    total_correct = sum(m["correct"] for m in instrument_metrics.values())
+    total_samples = sum(m["total"] for m in instrument_metrics.values())
+    overall_acc = total_correct / total_samples
 
-    val_acc = all_correct / all_total
-    print(f"\n✅ Backtest Accuracy: {val_acc:.4f}")
-    return val_acc, instrument_acc
+    print(f"\n✅ Backtest complete - Overall Accuracy: {overall_acc:.4f}")
+    wandb.log({"backtest_accuracy": overall_acc})
+
+    for inst, stats in instrument_metrics.items():
+        acc = stats["correct"] / stats["total"] if stats["total"] > 0 else 0.0
+        print(f"{inst}: {acc:.4f}")
+        wandb.log({f"{inst}_accuracy": acc})
+
+    wandb.finish()
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Path to model checkpoint (.pt)")
+    parser.add_argument("--model", required=True, help="Path to .pt model checkpoint")
     args = parser.parse_args()
-
-    print(f"🔍 Loading checkpoint from {args.model}")
-    checkpoint = torch.load(args.model, map_location="cpu")
-
-    # Figure out model type
-    is_fast = 'OptimizedDeribitModel' in args.model or 'max_speed' in args.model
-    model_class = OptimizedDeribitModel if is_fast else DeribitHybridModel
-    model_args = checkpoint.get('model_args') or {
-        'input_dim': 43,
-        'tcn_channels': [64, 64],
-        'tcn_kernel_size': 3,
-        'transformer_dim': 64,
-        'transformer_heads': 4,
-        'transformer_layers': 2,
-        'dropout': 0.2,
-        'max_seq_length': 512
-    }
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model_class(**model_args).to(device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-
-    # Use all cached instruments
-    instruments = sorted([
-        f[6:-8] for f in os.listdir("/mnt/p/perpetual/cache")
-        if f.startswith("tier1_") and f.endswith(".parquet")
-    ])
-
-    print(f"📡 Instruments: {instruments}")
-    print("🧪 Loading validation data...")
-    X, y, asset_ids_tensor, asset_ids_map = load_data(instruments, seq_length=model_args.get('max_seq_length', 64))
-
-    val_dataset = TensorDataset(X, y, asset_ids_tensor)
-    val_loader = DataLoader(val_dataset, batch_size=512, shuffle=False, pin_memory=True)
-
-    run = wandb.init(
-        project="deribit-perpetual-model",
-        name=f"backtest_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-        config={"model": args.model, "instruments": instruments}
-    )
-
-    acc, per_instrument = evaluate(model, val_loader, device, asset_ids_map)
-    wandb.log({"val_direction_acc": acc})
-    for name, (correct, total) in per_instrument.items():
-        if total > 0:
-            wandb.log({f"acc_{name}": correct / total})
-
-    wandb.finish()
+    run_backtest(args.model)
 
 if __name__ == "__main__":
     main()
