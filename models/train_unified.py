@@ -80,22 +80,22 @@ class FastDataset:
                 table = pq.read_table(parquet_path, memory_map=True)
                 df = table.to_pandas()
                 
-                # Create forward-looking labels efficiently
-                df['next_return_1bar'] = df['return_1bar'].shift(-1)
-                df['next_return_2bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2)
-                df['next_return_4bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2) + \
-                                    df['return_1bar'].shift(-3) + df['return_1bar'].shift(-4)
-                df['next_volatility'] = df['return_1bar'].rolling(4).std().shift(-4)
+                # Use the pre-computed forward-looking metrics directly
+                # These are already in our database from compute_tier1.py
+                df['next_volatility'] = df['future_volatility']
+                # For backward compatibility, ensure these columns exist
+                if 'future_return_1bar' not in df.columns:
+                    print(f"Warning: 'future_return_1bar' not found in data, using fallback")
+                    df['future_return_1bar'] = df['return_1bar'].shift(-1)
+                    df['future_return_2bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2)
+                    df['future_return_4bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2) + \
+                                          df['return_1bar'].shift(-3) + df['return_1bar'].shift(-4)
+                    df['future_volatility'] = df['return_1bar'].rolling(4).std().shift(-4)
+                    df['signal_confidence'] = 1.0  # Default confidence
                 
                 # Fill NaNs
                 for col in self.label_columns:
                     df.loc[df.index[-4:], col] = 0
-                
-                # Create direction class
-                volatility = df['return_1bar'].rolling(20).std().fillna(0.001)
-                df['direction_class'] = 0
-                df.loc[df['next_return_1bar'] > 0.5 * volatility, 'direction_class'] = 1
-                df.loc[df['next_return_1bar'] < -0.5 * volatility, 'direction_class'] = -1
                 
                 # Store feature columns if not already set
                 if self.feature_columns is None:
@@ -220,8 +220,8 @@ class FastDataset:
 def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device, 
           num_epochs=1, patience=3, gradient_accumulation=1, model_save_path="./models", 
           profiler=None, use_wandb=True,
-          max_speed=False, instruments=None, model_params=None, training_params=None):
-
+          max_speed=False, instruments=None, model_params=None, training_params=None,
+          feature_columns=None):
     """
     Simplified training function with essential optimizations
     """
@@ -434,7 +434,8 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
                     "model_type": "OptimizedDeribitModel" if max_speed else "DeribitHybridModel",
                     "instruments": instruments,
                     "model_params": model_params,
-                    "training_params": training_params
+                    "training_params": training_params,
+                    "feature_columns": list(feature_columns)
                 }, f, indent=2)
 
             print(f"✅ Model improved! Saved to {checkpoint_path}")
@@ -744,7 +745,8 @@ def main():
         max_speed=max_speed,
         instruments=instruments,
         model_params=model_params,
-        training_params=training_params
+        training_params=training_params,
+        feature_columns=data.feature_columns
     )
 
     # Clean up temporary config file if we created one

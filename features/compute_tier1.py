@@ -369,8 +369,8 @@ def calculate_relative_ranks(instrument_name, timestamp, conn):
 def calculate_future_returns_and_labels(df: pd.DataFrame, instrument_name: str) -> pd.DataFrame:
     """
     Advanced dual labeling strategy with adaptive thresholds:
-    1. direction_class: Perfect balance using global percentiles (for training)
-    2. direction_signal: Smart dynamic thresholds (for live trading)
+    1. direction_class: Perfect balance using global percentiles (for training) - Using 0,1,2
+    2. direction_signal: Smart dynamic thresholds (for live trading) - Using 0,1,2
     3. signal_confidence: Normalized move magnitude for flexible decision making
     """
     # Calculate future returns
@@ -393,8 +393,9 @@ def calculate_future_returns_and_labels(df: pd.DataFrame, instrument_name: str) 
         quantiles = valid_returns.quantile([1/3, 2/3]).values
         
         # Assign classes based on global percentiles - ensures exact 33/33/33 split
+        # UPDATED: Using 0, 1, 2 instead of -1, 0, 1
         df['direction_class'] = 1  # Default to neutral (middle)
-        df.loc[df['future_return_1bar'] <= quantiles[0], 'direction_class'] = 0  # Bottom third → down
+        df.loc[df['future_return_1bar'] <= quantiles[0], 'direction_class'] = 0  # Bottom third → down (was -1)
         df.loc[df['future_return_1bar'] >= quantiles[1], 'direction_class'] = 2  # Top third → up
     else:
         df['direction_class'] = 1  # Default if no valid returns
@@ -452,9 +453,10 @@ def calculate_future_returns_and_labels(df: pd.DataFrame, instrument_name: str) 
     vol_thresh = threshold_factor * df['volatility_20bar']
     
     # Generate trading signals
+    # UPDATED: Using 0, 1, 2 instead of -1, 0, 1
     df['direction_signal'] = 1  # Default to neutral
-    df.loc[df['future_return_1bar'] > vol_thresh, 'direction_signal'] = 2  # Up signal
-    df.loc[df['future_return_1bar'] < -vol_thresh, 'direction_signal'] = 0  # Down signal
+    df.loc[df['future_return_1bar'] > vol_thresh, 'direction_signal'] = 2  # Up signal (was 1)
+    df.loc[df['future_return_1bar'] < -vol_thresh, 'direction_signal'] = 0  # Down signal (was -1)
     
     # --------------------------------------------------------------------
     # 3. SIGNAL_CONFIDENCE: Normalized magnitude for flexible decisions

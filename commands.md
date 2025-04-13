@@ -11,6 +11,8 @@ python -m models.train_unified.py --quick-test
 # Full training (all instruments)
 python -m models.train_unified.py
 
+wandb agent robertfreericks-roro-studio/deribit-perpetual-model/24lt2kla --max-speed=true
+
 
 # Run backtest
 python -m simulate.backtest --model /mnt/p/perpetual/models/checkpoints/model_20250412_172238_best.pt

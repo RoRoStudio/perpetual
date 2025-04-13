@@ -22,35 +22,32 @@ def load_sidecar_config(checkpoint_path):
     with open(json_path, "r") as f:
         return json.load(f)
 
-def load_dataset(instruments, seq_length):
+def load_dataset(instruments, seq_length, feature_columns):
     all_features = []
     all_targets = []
     all_asset_ids = []
     asset_map = {inst: idx for idx, inst in enumerate(instruments)}
-    feature_columns = None
-    label_cols = ["next_return_1bar", "next_return_2bar", "next_return_4bar", "direction_class", "next_volatility"]
+    label_cols = ["future_return_1bar", "future_return_2bar", "future_return_4bar",
+                  "direction_class", "direction_signal", "future_volatility", "signal_confidence"]
 
     for instrument in instruments:
         path = f"/mnt/p/perpetual/cache/tier1_{instrument}.parquet"
         table = pq.read_table(path, memory_map=True)
         df = table.to_pandas()
 
-        df['next_return_1bar'] = df['return_1bar'].shift(-1)
-        df['next_return_2bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2)
-        df['next_return_4bar'] = sum(df['return_1bar'].shift(-i) for i in range(1, 5))
-        df['next_volatility'] = df['return_1bar'].rolling(4).std().shift(-4)
+        # Recompute targets from return_1bar
+        df['future_return_1bar'] = df['return_1bar'].shift(-1)
+        df['future_return_2bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2)
+        df['future_return_4bar'] = sum(df['return_1bar'].shift(-i) for i in range(1, 5))
+        df['future_volatility'] = df['return_1bar'].rolling(4).std().shift(-4)
 
         volatility = df['return_1bar'].rolling(20).std().fillna(0.001)
         df['direction_class'] = 0
-        df.loc[df['next_return_1bar'] > 0.5 * volatility, 'direction_class'] = 1
-        df.loc[df['next_return_1bar'] < -0.5 * volatility, 'direction_class'] = -1
+        df.loc[df['future_return_1bar'] > 0.5 * volatility, 'direction_class'] = 1
+        df.loc[df['future_return_1bar'] < -0.5 * volatility, 'direction_class'] = -1
 
         for col in label_cols:
             df[col].fillna(0, inplace=True)
-
-        if feature_columns is None:
-            exclude = label_cols + ['instrument_name', 'timestamp']
-            feature_columns = [col for col in df.columns if col not in exclude]
 
         transformer = FeatureTransformer(instrument)
         features_df = transformer.transform(df[feature_columns])
@@ -66,8 +63,7 @@ def load_dataset(instruments, seq_length):
 
         for i in range(num_seqs):
             feat_seq[i] = torch.tensor(features_np[i:i + seq_length])
-            # Get direction_class from final timestep, shift from [-1,0,1] to [0,1,2]
-            targ_seq[i] = int(targets_np[i + seq_length - 1][3] + 1)
+            targ_seq[i] = int(targets_np[i + seq_length - 1][3] + 1)  # shift to [0,1,2]
 
         all_features.append(feat_seq)
         all_targets.append(targ_seq)
@@ -118,8 +114,13 @@ def main():
     training_params = metadata["training_params"]
     seq_length = training_params.get("seq_length", 64)
 
-    # Load dataset
-    features, targets, asset_ids = load_dataset(instruments, seq_length)
+    # NEW: Read feature columns from training config
+    feature_columns = metadata.get("feature_columns")
+    if not feature_columns:
+        raise ValueError("Missing 'feature_columns' in sidecar config.")
+
+    # Load dataset with correct feature column list
+    features, targets, asset_ids = load_dataset(instruments, seq_length, feature_columns)
     dataset = TensorDataset(features, targets, asset_ids)
     loader = DataLoader(dataset, batch_size=512, shuffle=False)
 
