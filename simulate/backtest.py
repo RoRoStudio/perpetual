@@ -27,24 +27,15 @@ def load_dataset(instruments, seq_length, feature_columns):
     all_targets = []
     all_asset_ids = []
     asset_map = {inst: idx for idx, inst in enumerate(instruments)}
-    label_cols = ["future_return_1bar", "future_return_2bar", "future_return_4bar",
-                  "direction_class", "direction_signal", "future_volatility", "signal_confidence"]
+    label_cols = ["direction_class"]
 
     for instrument in instruments:
         path = f"/mnt/p/perpetual/cache/tier1_{instrument}.parquet"
         table = pq.read_table(path, memory_map=True)
         df = table.to_pandas()
 
-        # Recompute targets from return_1bar
-        df['future_return_1bar'] = df['return_1bar'].shift(-1)
-        df['future_return_2bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2)
-        df['future_return_4bar'] = sum(df['return_1bar'].shift(-i) for i in range(1, 5))
-        df['future_volatility'] = df['return_1bar'].rolling(4).std().shift(-4)
-
-        volatility = df['return_1bar'].rolling(20).std().fillna(0.001)
-        df['direction_class'] = 0
-        df.loc[df['future_return_1bar'] > 0.5 * volatility, 'direction_class'] = 1
-        df.loc[df['future_return_1bar'] < -0.5 * volatility, 'direction_class'] = -1
+        if "direction_class" not in df.columns:
+            raise ValueError(f"Missing direction_class in {instrument} data")
 
         for col in label_cols:
             df[col].fillna(0, inplace=True)
@@ -63,7 +54,7 @@ def load_dataset(instruments, seq_length, feature_columns):
 
         for i in range(num_seqs):
             feat_seq[i] = torch.tensor(features_np[i:i + seq_length])
-            targ_seq[i] = int(targets_np[i + seq_length - 1][3] + 1)  # shift to [0,1,2]
+            targ_seq[i] = int(targets_np[i + seq_length - 1][0] + 1)  # shift to [0,1,2]
 
         all_features.append(feat_seq)
         all_targets.append(targ_seq)
@@ -114,7 +105,7 @@ def main():
     training_params = metadata["training_params"]
     seq_length = training_params.get("seq_length", 64)
 
-    # NEW: Read feature columns from training config
+    # Read feature columns from training config
     feature_columns = metadata.get("feature_columns")
     if not feature_columns:
         raise ValueError("Missing 'feature_columns' in sidecar config.")
