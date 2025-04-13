@@ -93,16 +93,23 @@ def export_all_instruments(output_dir, overwrite=False, max_workers=4):
         List of paths to exported Parquet files
     """
     try:
-        # Get list of instruments
+        # Get list of instruments marked as 'used' in the database
         conn = get_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT DISTINCT instrument_name
-                FROM model_features_15m_tier1
-                ORDER BY instrument_name
-            """)
-            instruments = [row[0] for row in cur.fetchall()]
-        conn.close()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT i.instrument_name
+                    FROM instruments i
+                    WHERE i.used = TRUE
+                    ORDER BY i.instrument_name
+                """)
+                instruments = [row[0] for row in cur.fetchall()]
+            
+            # No fallback - require database to return instruments
+            if not instruments:
+                raise ValueError("No instruments found with used=TRUE in database. Check instruments table.")
+        finally:
+            conn.close()
         
         logger.info(f"Found {len(instruments)} instruments")
         

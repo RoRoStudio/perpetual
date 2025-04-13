@@ -365,6 +365,110 @@ def calculate_relative_ranks(instrument_name, timestamp, conn):
         logger.error(f"Error calculating ranks: {e}")
         return None, None
 
+# --- NEW: Calculate future returns and dual labels with adaptive thresholds
+def calculate_future_returns_and_labels(df: pd.DataFrame, instrument_name: str) -> pd.DataFrame:
+    """
+    Advanced dual labeling strategy with adaptive thresholds:
+    1. direction_class: Perfect balance using global percentiles (for training)
+    2. direction_signal: Smart dynamic thresholds (for live trading)
+    3. signal_confidence: Normalized move magnitude for flexible decision making
+    """
+    # Calculate future returns
+    df['future_return_1bar'] = df['close'].shift(-1).combine_first(df['close']) / df['close'] - 1
+    
+    # Calculate multi-bar future returns
+    df['future_return_2bar'] = df['close'].shift(-2).combine_first(df['close']) / df['close'] - 1
+    df['future_return_4bar'] = df['close'].shift(-4).combine_first(df['close']) / df['close'] - 1
+    
+    # Calculate future volatility
+    df['future_volatility'] = df['return_1bar'].rolling(4).std().shift(-4).fillna(0)
+    
+    # Store original non-null future returns for global percentile calculation
+    valid_returns = df['future_return_1bar'].dropna()
+    
+    # --------------------------------------------------------------------
+    # 1. DIRECTION_CLASS: Global percentile-based labels for perfect balance
+    # --------------------------------------------------------------------
+    if len(valid_returns) > 0:
+        quantiles = valid_returns.quantile([1/3, 2/3]).values
+        
+        # Assign classes based on global percentiles - ensures exact 33/33/33 split
+        df['direction_class'] = 1  # Default to neutral (middle)
+        df.loc[df['future_return_1bar'] <= quantiles[0], 'direction_class'] = 0  # Bottom third → down
+        df.loc[df['future_return_1bar'] >= quantiles[1], 'direction_class'] = 2  # Top third → up
+    else:
+        df['direction_class'] = 1  # Default if no valid returns
+    
+    # --------------------------------------------------------------------
+    # 2. DIRECTION_SIGNAL: Smart adaptive thresholds for real trading
+    # --------------------------------------------------------------------
+    # Calculate multiple volatility windows for adaptive thresholding
+    vol_window = 20  # 20 bars = 5 hours for 15m bars
+    df['volatility_20bar'] = df['return_1bar'].rolling(vol_window).std().fillna(0.001)
+    
+    # Calculate long-term vol for reference (80 bars = 20 hours)
+    long_vol = df['return_1bar'].rolling(80).std().fillna(df['volatility_20bar'])
+    
+    # Calculate volatility ratio (short-term vs long-term)
+    vol_ratio = df['volatility_20bar'] / long_vol
+    
+    # SMART ADAPTIVE THRESHOLD SCALING:
+    # 1. Start with baseline threshold factor (lower than original 0.5)
+    base_threshold = 0.35
+    
+    # 2. Adjust threshold based on instrument's volatility characteristics
+    # - For major coins (BTC, ETH): Keep threshold higher
+    # - For altcoins: Lower threshold to capture more signals
+    instrument_adjustment = {
+        'BTC_USDC-PERPETUAL': 1.1,  # Higher threshold for BTC
+        'ETH_USDC-PERPETUAL': 1.0,  # Standard threshold for ETH
+        'SOL_USDC-PERPETUAL': 0.9,  # Slightly lower for major altcoins
+        'XRP_USDC-PERPETUAL': 0.9,
+        'AVAX_USDC-PERPETUAL': 0.9,
+        'DOGE_USDC-PERPETUAL': 0.8,
+        'DOT_USDC-PERPETUAL': 0.8, 
+        'ADA_USDC-PERPETUAL': 0.8,
+        'LTC_USDC-PERPETUAL': 0.8,
+        'LINK_USDC-PERPETUAL': 0.7,
+        'ALGO_USDC-PERPETUAL': 0.7,
+        'BCH_USDC-PERPETUAL': 0.7,
+        'NEAR_USDC-PERPETUAL': 0.7,
+        'UNI_USDC-PERPETUAL': 0.6,
+        'TRX_USDC-PERPETUAL': 0.5,  # Much lower for stable coins
+    }.get(instrument_name, 0.7)  # Default adjustment for unknown instruments
+    
+    # 3. Dynamic adjustment based on current market conditions
+    # - In high volatility regimes (vol_ratio > 1.5): Increase threshold
+    # - In low volatility regimes (vol_ratio < 0.5): Decrease threshold
+    dynamic_factor = np.sqrt(vol_ratio).clip(0.7, 1.3)
+    
+    # 4. Compute final threshold with all adjustments
+    threshold_factor = base_threshold * instrument_adjustment * dynamic_factor
+    
+    # Ensure threshold is at least 0.2*vol (minimum signal detection)
+    threshold_factor = np.maximum(threshold_factor, 0.2)
+    
+    # Calculate the final threshold for signal detection
+    vol_thresh = threshold_factor * df['volatility_20bar']
+    
+    # Generate trading signals
+    df['direction_signal'] = 1  # Default to neutral
+    df.loc[df['future_return_1bar'] > vol_thresh, 'direction_signal'] = 2  # Up signal
+    df.loc[df['future_return_1bar'] < -vol_thresh, 'direction_signal'] = 0  # Down signal
+    
+    # --------------------------------------------------------------------
+    # 3. SIGNAL_CONFIDENCE: Normalized magnitude for flexible decisions
+    # --------------------------------------------------------------------
+    # Signal confidence = absolute return / volatility (normalized move size)
+    df['signal_confidence'] = (np.abs(df['future_return_1bar']) / 
+                              df['volatility_20bar'].replace(0, 0.001)).clip(0, 5)
+    
+    # Calculate return quantile rank (useful for model calibration)
+    df['return_quantile_rank'] = (valid_returns.rank(pct=True).reindex(df.index)
+                                 .fillna(0.5))  # Default to middle rank if no data
+    
+    return df
+
 # --- Compute features for a single instrument
 def compute_features_for_instrument(conn, instrument_name: str):
     """Compute comprehensive tier 1 features for an instrument"""
@@ -554,6 +658,12 @@ def compute_features_for_instrument(conn, instrument_name: str):
         # Add instrument name
         df['instrument_name'] = instrument_name
         
+        # NEW: Calculate future returns and advanced labels using the state-of-the-art approach
+        df = calculate_future_returns_and_labels(df, instrument_name)
+        
+        # Add instrument name
+        df['instrument_name'] = instrument_name
+        
         # Keep only allowed columns and drop any remaining NaN rows
         keep_cols = [
             "instrument_name", "timestamp",
@@ -569,7 +679,11 @@ def compute_features_for_instrument(conn, instrument_name: str):
             "correlation_with_btc", "correlation_with_eth",
             "relative_return_rank", "relative_funding_rank",
             "hour_of_day_sin", "hour_of_day_cos", "day_of_week_sin", "day_of_week_cos",
-            "is_weekend", "mins_to_next_funding"
+            "is_weekend", "mins_to_next_funding",
+            # NEW: Add the new columns for future returns and advanced dual labels
+            "future_return_1bar", "future_return_2bar", "future_return_4bar",
+            "future_volatility", "direction_class", "direction_signal", "return_quantile_rank",
+            "volatility_20bar", "signal_confidence"
         ]
         
         # Ensure we only keep columns that are in the keep_cols list

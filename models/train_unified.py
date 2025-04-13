@@ -541,37 +541,33 @@ def main():
     # Use W&B unless explicitly disabled
     use_wandb = not args.no_wandb
     
-    # Default instruments if not provided - use all available instruments
+    # Default instruments if not provided - use instruments marked as 'used' in the database
     if not args.instruments:
-        # Get all instruments from the Parquet cache
-        cache_dir = "/mnt/p/perpetual/cache"
-        if os.path.exists(cache_dir):
-            all_instruments = []
-            for filename in os.listdir(cache_dir):
-                if filename.startswith("tier1_") and filename.endswith(".parquet"):
-                    instrument = filename[6:-8]  # Remove "tier1_" and ".parquet"
-                    all_instruments.append(instrument)
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT instrument_name FROM instruments 
+                    WHERE used = TRUE ORDER BY instrument_name
+                """)
+                instruments = [row[0] for row in cur.fetchall()]
             
-            # If no instruments found in cache, use default list
-            if not all_instruments:
-                all_instruments = ["BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL", "SOL_USDC-PERPETUAL", 
-                           "XRP_USDC-PERPETUAL", "DOGE_USDC-PERPETUAL", "AVAX_USDC-PERPETUAL",
-                           "DOT_USDC-PERPETUAL", "MATIC_USDC-PERPETUAL", "ADA_USDC-PERPETUAL",
-                           "SHIB_USDC-PERPETUAL", "LTC_USDC-PERPETUAL", "LINK_USDC-PERPETUAL",
-                           "ATOM_USDC-PERPETUAL", "UNI_USDC-PERPETUAL", "TRX_USDC-PERPETUAL"]
-        else:
-            # If cache dir doesn't exist, use default list
-            all_instruments = ["BTC_USDC-PERPETUAL", "ETH_USDC-PERPETUAL", "SOL_USDC-PERPETUAL", 
-                       "XRP_USDC-PERPETUAL", "DOGE_USDC-PERPETUAL", "AVAX_USDC-PERPETUAL",
-                       "DOT_USDC-PERPETUAL", "MATIC_USDC-PERPETUAL", "ADA_USDC-PERPETUAL",
-                       "SHIB_USDC-PERPETUAL", "LTC_USDC-PERPETUAL", "LINK_USDC-PERPETUAL",
-                       "ATOM_USDC-PERPETUAL", "UNI_USDC-PERPETUAL", "TRX_USDC-PERPETUAL"]
-        
-        # For quick-test mode, just use BTC
-        if args.quick_test:
-            instruments = ["BTC_USDC-PERPETUAL"]
-        else:
-            instruments = all_instruments
+            # No fallback - require database to return instruments
+            if not instruments:
+                raise ValueError("No instruments found with used=TRUE in database. Check instruments table.")
+                
+            # For quick-test mode, just use BTC if it's in the list
+            if args.quick_test:
+                if "BTC_USDC-PERPETUAL" in instruments:
+                    instruments = ["BTC_USDC-PERPETUAL"]
+                else:
+                    # Otherwise use the first instrument
+                    instruments = [instruments[0]]
+        except Exception as e:
+            logger.error(f"Error fetching instruments: {e}")
+            raise  # Re-raise exception to halt execution
+        finally:
+            conn.close()
     else:
         instruments = args.instruments
     

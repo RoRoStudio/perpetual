@@ -1,5 +1,5 @@
 # Before training
-python -m features.export_parquet
+python -m features.export_parquet --overwrite
 
 
 # With profiler
@@ -13,7 +13,7 @@ python -m models.train_unified.py
 
 
 # Run backtest
-python -m simulate.backtest --model /mnt/p/perpetual/models/checkpoints/model_20250412_150846_best.pt
+python -m simulate.backtest --model /mnt/p/perpetual/models/checkpoints/model_20250412_172238_best.pt
 
 
 # Get resources details (bash command)

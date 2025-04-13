@@ -1,0 +1,37 @@
+{
+  "model_type": "DeribitHybridModel",
+  "instruments": [
+    "ADA_USDC-PERPETUAL",
+    "ALGO_USDC-PERPETUAL",
+    "AVAX_USDC-PERPETUAL",
+    "BCH_USDC-PERPETUAL",
+    "BTC_USDC-PERPETUAL",
+    "DOGE_USDC-PERPETUAL",
+    "DOT_USDC-PERPETUAL",
+    "ETH_USDC-PERPETUAL",
+    "LINK_USDC-PERPETUAL",
+    "LTC_USDC-PERPETUAL",
+    "NEAR_USDC-PERPETUAL",
+    "SOL_USDC-PERPETUAL",
+    "TRX_USDC-PERPETUAL",
+    "UNI_USDC-PERPETUAL",
+    "XRP_USDC-PERPETUAL"
+  ],
+  "model_params": {
+    "dropout": 0.26244054223433894,
+    "max_seq_length": 482,
+    "tcn_kernel_size": 4,
+    "transformer_dim": 64,
+    "transformer_heads": 2,
+    "transformer_layers": 3
+  },
+  "training_params": {
+    "batch_size": 44,
+    "gradient_accumulation": 3,
+    "learning_rate": 0.0006326382957580211,
+    "num_epochs": 6,
+    "patience": 6,
+    "seq_length": 32,
+    "weight_decay": 8.378740841795518e-05
+  }
+}
