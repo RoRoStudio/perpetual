@@ -16,6 +16,13 @@ from scipy.stats import rankdata
 from numba import njit, prange
 import pandas as pd
 from typing import Tuple, Optional, Union, List
+import traceback
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("utils")
 
 # -------------------------------
 # Z-Score (rolling)
@@ -485,7 +492,7 @@ def compute_residual_returns(returns: np.ndarray, market_returns: np.ndarray, wi
 
 def crossover_signal(fast: np.ndarray, slow: np.ndarray) -> np.ndarray:
     """
-    Generate crossover signals (1=bullish, -1=bearish, 0=no signal)
+    Generate crossover signals (0=bearish, 1=neutral, 2=bullish)
     
     Args:
         fast: Fast line (e.g., price, short MA)
@@ -497,7 +504,7 @@ def crossover_signal(fast: np.ndarray, slow: np.ndarray) -> np.ndarray:
     if len(fast) != len(slow):
         raise ValueError(f"Arrays must be same length: fast={len(fast)}, slow={len(slow)}")
         
-    signal = np.zeros_like(fast, dtype=np.int8)
+    signal = np.ones(len(fast), dtype=np.int8)  # Default is 1 (neutral)
     
     # Skip if too short
     if len(fast) <= 1:
@@ -522,7 +529,32 @@ def crossover_signal(fast: np.ndarray, slow: np.ndarray) -> np.ndarray:
     bearish = prev_state & (~curr_state)
     
     # Set signals (shift by 1 to align with current bar)
-    signal[1:][bullish] = 1
-    signal[1:][bearish] = -1
+    signal[1:][bullish] = 2  # Bullish (was 1, now 2)
+    signal[1:][bearish] = 0  # Bearish (was -1, now 0)
     
     return signal
+
+# -------------------------------
+# Safe execution helper
+# -------------------------------
+
+def safe_execute(func, *args, **kwargs):
+    """
+    Safely execute a function with proper error tracking
+    
+    Args:
+        func: Function to execute
+        *args: Positional arguments to pass to the function
+        **kwargs: Keyword arguments to pass to the function
+        
+    Returns:
+        Tuple of (result, None) if successful, (None, (error_message, error_traceback)) if failed
+    """
+    try:
+        return func(*args, **kwargs), None
+    except Exception as e:
+        error_msg = f"Error executing {func.__name__}: {str(e)}"
+        error_trace = traceback.format_exc()
+        logger.error(error_msg)
+        logger.error(error_trace)
+        return None, (error_msg, error_trace)

@@ -19,11 +19,12 @@ from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
 import concurrent.futures
+import traceback
 
 # Add project root to path for imports
 sys.path.append('/mnt/p/perpetual')
 
-from data.database import get_connection
+from data.database import get_connection, db_connection
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -33,6 +34,7 @@ logger = logging.getLogger("export_parquet")
 def export_parquet(instrument, output_dir, overwrite=False):
     """
     Export tier1 features for a specific instrument to Parquet format.
+    Also validates and fixes direction class schema if needed.
     
     Args:
         instrument: Name of the instrument
@@ -51,33 +53,48 @@ def export_parquet(instrument, output_dir, overwrite=False):
     
     try:
         logger.info(f"Exporting data for {instrument}")
-        conn = get_connection()
-        
-        # Get data from PostgreSQL
-        df = pd.read_sql(
-            "SELECT * FROM model_features_15m_tier1 WHERE instrument_name = %s ORDER BY timestamp",
-            conn,
-            params=(instrument,)
-        )
-        
-        # Check if we got any data
-        if len(df) == 0:
-            logger.warning(f"No data found for {instrument}")
-            conn.close()
-            return None
+        with db_connection() as conn:
+            # Get data from PostgreSQL
+            df = pd.read_sql(
+                "SELECT * FROM model_features_15m_tier1 WHERE instrument_name = %s ORDER BY timestamp",
+                conn,
+                params=(instrument,)
+            )
             
-        logger.info(f"Retrieved {len(df)} rows for {instrument}")
-        
-        # Convert to PyArrow table and write to Parquet
-        table = pa.Table.from_pandas(df)
-        pq.write_table(table, output_path, compression="ZSTD")
-        
-        logger.info(f"Exported {instrument} to {output_path}")
-        conn.close()
-        return output_path
-        
+            # Check if we got any data
+            if len(df) == 0:
+                logger.warning(f"No data found for {instrument}")
+                return None
+                
+            logger.info(f"Retrieved {len(df)} rows for {instrument}")
+            
+            # Validate and fix direction class schema
+            if 'direction_class' in df.columns:
+                unique_classes = df['direction_class'].unique()
+                contains_negative = any(x < 0 for x in unique_classes if pd.notna(x))
+                
+                if contains_negative:
+                    logger.info(f"Fixing direction_class schema for {instrument} (-1,0,1 -> 0,1,2)")
+                    df['direction_class'] = df['direction_class'] + 1
+                    
+            if 'direction_signal' in df.columns:
+                unique_signals = df['direction_signal'].unique()
+                contains_negative = any(x < 0 for x in unique_signals if pd.notna(x))
+                
+                if contains_negative:
+                    logger.info(f"Fixing direction_signal schema for {instrument} (-1,0,1 -> 0,1,2)")
+                    df['direction_signal'] = df['direction_signal'] + 1
+            
+            # Convert to PyArrow table and write to Parquet
+            table = pa.Table.from_pandas(df)
+            pq.write_table(table, output_path, compression="ZSTD")
+            
+            logger.info(f"Exported {instrument} to {output_path}")
+            return output_path
+            
     except Exception as e:
         logger.error(f"Error exporting {instrument}: {e}")
+        logger.error(traceback.format_exc())
         return None
 
 def export_all_instruments(output_dir, overwrite=False, max_workers=4):
@@ -94,8 +111,7 @@ def export_all_instruments(output_dir, overwrite=False, max_workers=4):
     """
     try:
         # Get list of instruments marked as 'used' in the database
-        conn = get_connection()
-        try:
+        with db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT i.instrument_name
@@ -108,8 +124,6 @@ def export_all_instruments(output_dir, overwrite=False, max_workers=4):
             # No fallback - require database to return instruments
             if not instruments:
                 raise ValueError("No instruments found with used=TRUE in database. Check instruments table.")
-        finally:
-            conn.close()
         
         logger.info(f"Found {len(instruments)} instruments")
         
@@ -134,12 +148,14 @@ def export_all_instruments(output_dir, overwrite=False, max_workers=4):
                         exported_paths.append(path)
                 except Exception as e:
                     logger.error(f"Error exporting {instrument}: {e}")
+                    logger.error(traceback.format_exc())
                 
         logger.info(f"Successfully exported {len(exported_paths)} out of {len(instruments)} instruments")
         return exported_paths
         
     except Exception as e:
         logger.error(f"Error exporting all instruments: {e}")
+        logger.error(traceback.format_exc())
         return []
 
 def main():

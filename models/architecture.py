@@ -14,8 +14,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import logging
 from typing import Dict, List, Tuple, Optional, Union, Any
 
+# Configure logging
+logging.basicConfig(level=logging.INFO,
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("architecture")
 
 class CausalConv1d(nn.Module):
     """
@@ -189,8 +194,8 @@ class PositionalEncoding(nn.Module):
         
         # Prevent NaN in positional encoding
         if torch.isnan(pe_slice).any() or torch.isinf(pe_slice).any():
-            print("❌ NaN/Inf in positional encoding values BEFORE addition")
-            print(f"PE max: {torch.max(pe_slice)}, min: {torch.min(pe_slice)}")
+            logger.warning("❌ NaN/Inf in positional encoding values BEFORE addition")
+            logger.warning(f"PE max: {torch.max(pe_slice)}, min: {torch.min(pe_slice)}")
             # Fix the problematic values
             pe_slice = torch.nan_to_num(pe_slice, nan=0.0, posinf=5.0, neginf=-5.0)
         
@@ -199,8 +204,8 @@ class PositionalEncoding(nn.Module):
         
         # Final check for NaN/Inf
         if torch.isnan(x).any() or torch.isinf(x).any():
-            print("❌ NaN or Inf in final output of PositionalEncoding")
-            print("Sample x[0, -1, :10]:", x[0, -1, :10])
+            logger.warning("❌ NaN or Inf in final output of PositionalEncoding")
+            logger.warning(f"Sample x[0, -1, :10]: {x[0, -1, :10]}")
             # Fix the problematic values as a last resort
             x = torch.nan_to_num(x, nan=0.0, posinf=5.0, neginf=-5.0)
             
@@ -211,7 +216,8 @@ class CrossAssetAttention(nn.Module):
     """
     Multi-head attention layer with asset-aware relative position encoding.
     """
-    def __init__(self, embed_dim: int, num_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, embed_dim: int, num_heads: int = 8, dropout: float = 0.1,
+                max_assets: int = 100):
         super().__init__()
         self.multihead_attn = nn.MultiheadAttention(
             embed_dim=embed_dim,
@@ -219,6 +225,9 @@ class CrossAssetAttention(nn.Module):
             dropout=dropout,
             batch_first=True
         )
+        
+        # NEW: Add asset embedding
+        self.asset_embedding = nn.Embedding(max_assets, embed_dim)
         
     def forward(self, query, key, value, asset_ids=None):
         """
@@ -237,11 +246,21 @@ class CrossAssetAttention(nn.Module):
         
         # Apply asset-aware attention if asset IDs are provided
         if asset_ids is not None:
-            attn_mask = None  # Could create asset-aware attention mask here if needed
-        else:
-            attn_mask = None
+            # Get asset embeddings and add to query
+            # Reshape asset_ids to match query's batch dimension
+            if asset_ids.dim() == 1:
+                asset_ids = asset_ids.unsqueeze(1).expand(-1, query.size(1))
             
-        output, _ = self.multihead_attn(query, key, value, attn_mask=attn_mask)
+            # Get asset embeddings
+            asset_emb = self.asset_embedding(asset_ids)
+            
+            # Add asset embeddings to query/key/value for asset-aware attention
+            query = query + asset_emb
+            key = key + asset_emb
+            value = value + asset_emb
+            
+        # Apply attention
+        output, _ = self.multihead_attn(query, key, value)
         
         # Sanitize outputs
         output = torch.nan_to_num(output, nan=0.0, posinf=5.0, neginf=-5.0)
@@ -278,7 +297,8 @@ class CrossAssetTransformer(nn.Module):
         self.cross_asset_attention = CrossAssetAttention(
             embed_dim=d_model,
             num_heads=nhead,
-            dropout=dropout
+            dropout=dropout,
+            max_assets=100
         )
         
         # Add layer norm at the input to help stabilize
@@ -301,9 +321,9 @@ class CrossAssetTransformer(nn.Module):
         
         # Detect NaNs or Infs after positional encoding
         if torch.isnan(x).any() or torch.isinf(x).any():
-            print("❌ NaN or Inf in x after positional encoding!")
-            print(f"Shape: {x.shape}, dtype: {x.dtype}")
-            print("Sample slice:", x[0, -1, :10])
+            logger.warning("❌ NaN or Inf in x after positional encoding!")
+            logger.warning(f"Shape: {x.shape}, dtype: {x.dtype}")
+            logger.warning(f"Sample slice: {x[0, -1, :10]}")
             # Fix NaNs as a last resort
             x = torch.nan_to_num(x, nan=0.0, posinf=5.0, neginf=-5.0)
         
@@ -313,11 +333,11 @@ class CrossAssetTransformer(nn.Module):
             
             # Verify output is valid
             if torch.isnan(out).any() or torch.isinf(out).any():
-                print("❌ NaN/Inf detected in transformer output!")
+                logger.warning("❌ NaN/Inf detected in transformer output!")
                 # Fix as last resort
                 out = torch.nan_to_num(out, nan=0.0, posinf=5.0, neginf=-5.0)
         except Exception as e:
-            print(f"Exception in transformer: {e}")
+            logger.error(f"Exception in transformer: {e}")
             # Fallback: skip transformer if it fails
             out = x
             
@@ -326,7 +346,7 @@ class CrossAssetTransformer(nn.Module):
             try:
                 out = self.cross_asset_attention(out, out, out, asset_ids)
             except Exception as e:
-                print(f"Exception in cross-asset attention: {e}")
+                logger.error(f"Exception in cross-asset attention: {e}")
                 # No change if cross-asset attention fails
                 pass
                 
@@ -556,7 +576,7 @@ class DeribitHybridModel(nn.Module):
             nn.Sigmoid()
         )
         
-        # Direction classification head (3-way: long, flat, short)
+        # Direction classification head (3-way: down, neutral, up using 0,1,2)
         self.direction_head = nn.Sequential(
             nn.Linear(transformer_dim, 64),
             nn.LayerNorm(64),
@@ -565,7 +585,7 @@ class DeribitHybridModel(nn.Module):
             nn.Linear(64, 3)
         )
 
-        # Signal classification head for real trading signals
+        # Signal classification head for real trading signals (0,1,2)
         self.signal_head = nn.Sequential(
             nn.Linear(transformer_dim, 64),
             nn.LayerNorm(64),
@@ -636,9 +656,10 @@ class DeribitHybridModel(nn.Module):
         Returns:
             Dictionary of outputs from all heads
         """
+        # Improved numerical stability protection
         batch_size, seq_len, _ = x.shape
         
-        # Add numerical stability protection in input pipeline
+        # Apply input preprocessing with better bounds
         x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
         x = torch.clamp(x, min=-20.0, max=20.0)
         
@@ -657,13 +678,6 @@ class DeribitHybridModel(nn.Module):
         transformer_input = self.tcn_to_transformer(tcn_output)
         transformer_input = torch.nan_to_num(transformer_input, nan=0.0, posinf=5.0, neginf=-5.0)
 
-        # Check for NaNs/Infs BEFORE transformer
-        if torch.isnan(transformer_input).any() or torch.isinf(transformer_input).any():
-            print("❌ NaN or Inf in transformer_input!")
-            print(f"Shape: {transformer_input.shape}, dtype: {transformer_input.dtype}")
-            print("Sample slice:", transformer_input[0, -1, :10])  # Show 10 values of last timestep
-            transformer_input = torch.nan_to_num(transformer_input, nan=0.0, posinf=5.0, neginf=-5.0)
-               
         # Apply transformer for global dependencies
         transformer_output = self.transformer(transformer_input, asset_ids)
         transformer_output = torch.nan_to_num(transformer_output, nan=0.0, posinf=5.0, neginf=-5.0)
@@ -728,15 +742,15 @@ class DeribitHybridModel(nn.Module):
             position_size = outputs['position_size']
             
             # Determine trading action
-            trade_action = torch.argmax(signal_probs, dim=1)  # 0=short, 1=flat, 2=long
+            trade_action = torch.argmax(signal_probs, dim=1)  # 0=down, 1=neutral, 2=up
             
             # Apply confidence threshold
             confidence = torch.max(signal_probs, dim=1)[0]
             valid_trades = confidence >= threshold
             
             # Create final position size incorporating direction and sizing
-            # Convert 0,1,2 to -1,0,1
-            direction = (trade_action - 1).float()
+            # Convert 0,1,2 to -1,0,1 for position sizing calculation
+            direction = trade_action.float() - 1.0
             
             # Final position is direction * size * confidence
             final_position = direction * torch.abs(position_size.squeeze()) * confidence
@@ -746,6 +760,7 @@ class DeribitHybridModel(nn.Module):
             
             return {
                 'direction': direction,
+                'trade_action': trade_action,  # Raw trade_action (0,1,2)
                 'position_size': final_position,
                 'confidence': confidence,
                 'expected_return': outputs['expected_return'].squeeze(),
@@ -1144,7 +1159,7 @@ class SimplifiedPortfolioHead(nn.Module):
 # OPTIMIZATION: OptimizedDeribitModel - Complete optimized model
 class OptimizedDeribitModel(nn.Module):
     """
-    Optimized hybrid model for much faster training.
+    Optimized hybrid model for much faster training, maintaining the same API.
     """
     def __init__(
         self, 
@@ -1207,7 +1222,7 @@ class OptimizedDeribitModel(nn.Module):
         self.signal_head = nn.Sequential(
             nn.Linear(transformer_dim, 64),
             nn.LayerNorm(64),
-            nn.Mish(),
+            nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(64, 3)
         )
@@ -1216,7 +1231,7 @@ class OptimizedDeribitModel(nn.Module):
         self.confidence_head = nn.Sequential(
             nn.Linear(transformer_dim, 32),
             nn.LayerNorm(32),
-            nn.Mish(),
+            nn.SiLU(),
             nn.Linear(32, 1),
             nn.ReLU()  # Confidence is always positive
         )
@@ -1310,7 +1325,7 @@ class OptimizedDeribitModel(nn.Module):
     
     def predict_trade_signal(self, x, funding_rate=None, asset_ids=None, threshold=0.0):
         """
-        Generate a trade signal from model outputs.
+        Generate a trade signal from model outputs - same API as DeribitHybridModel
         
         Args:
             x: Input features [batch_size, seq_len, input_dim]
@@ -1331,15 +1346,15 @@ class OptimizedDeribitModel(nn.Module):
             position_size = outputs['position_size']
             
             # Determine trading action
-            trade_action = torch.argmax(signal_probs, dim=1)  # 0=short, 1=flat, 2=long
+            trade_action = torch.argmax(signal_probs, dim=1)  # 0=down, 1=neutral, 2=up
             
             # Apply confidence threshold
             confidence = torch.max(signal_probs, dim=1)[0]
             valid_trades = confidence >= threshold
             
             # Create final position size incorporating direction and sizing
-            # Convert 0,1,2 to -1,0,1
-            direction = (trade_action - 1).float()
+            # Convert 0,1,2 to -1,0,1 for position calculation
+            direction = trade_action.float() - 1.0
             
             # Final position is direction * size * confidence
             final_position = direction * torch.abs(position_size.squeeze()) * confidence
@@ -1349,6 +1364,7 @@ class OptimizedDeribitModel(nn.Module):
             
             return {
                 'direction': direction,
+                'trade_action': trade_action,  # Raw trade_action (0,1,2)
                 'position_size': final_position,
                 'confidence': confidence,
                 'expected_return': outputs['expected_return'].squeeze(),

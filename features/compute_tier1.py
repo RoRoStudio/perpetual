@@ -1,4 +1,3 @@
-# Compute model_features_15m_tier1: real-time safe feature matrix
 #!/usr/bin/env python3
 """
 compute_tier1.py
@@ -25,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import traceback
 
-from data.database import get_connection
+from data.database import get_connection, db_connection
 from features.utils import (
     padded_log_return,
     rolling_zscore,
@@ -118,6 +117,7 @@ def load_ohlcv_data(conn, instrument_name: str, limit=None) -> pd.DataFrame:
             return df
     except Exception as e:
         logger.error(f"Error loading OHLCV data for {instrument_name}: {e}")
+        logger.error(traceback.format_exc())
         return pd.DataFrame()
 
 # --- Fetch funding data with cursor
@@ -158,6 +158,7 @@ def load_funding_data(conn, instrument_name: str, limit=None) -> pd.DataFrame:
             return df
     except Exception as e:
         logger.error(f"Error loading funding data for {instrument_name}: {e}")
+        logger.error(traceback.format_exc())
         return pd.DataFrame()
 
 # --- Fetch volatility index with cursor
@@ -198,6 +199,7 @@ def load_vol_index_data(conn, currency: str, limit=None) -> pd.DataFrame:
             return df
     except Exception as e:
         logger.error(f"Error loading volatility data for {currency}: {e}")
+        logger.error(traceback.format_exc())
         return pd.DataFrame()
 
 # --- Load BTC/ETH data for cross-asset features
@@ -272,18 +274,19 @@ def load_btc_eth_data(conn, limit=None):
 
     except Exception as e:
         logger.error(f"Error loading BTC/ETH data: {e}")
-        traceback.print_exc()
+        logger.error(traceback.format_exc())
         empty_df = pd.DataFrame(columns=['timestamp'])
         return empty_df, empty_df, empty_df, empty_df
 
 
 # --- Get returns for all instruments (for ranking)
 def load_all_instrument_returns(conn, current_timestamp, window=20):
-    """Load returns for all active instruments for relative ranking"""
+    """Load returns for all active instruments for relative ranking - optimized version"""
     try:
         # Get timestamp range for the window
         start_ts = current_timestamp - timedelta(days=1)
         
+        # Get all instruments in a single query
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT DISTINCT instrument_name
@@ -295,45 +298,91 @@ def load_all_instrument_returns(conn, current_timestamp, window=20):
         all_returns = {}
         all_funding = {}
         
-        for instrument in instruments:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT timestamp, close
-                        FROM historical_ohlcv_data
-                        WHERE instrument_name = %s
-                        AND timestamp BETWEEN %s AND %s
-                        ORDER BY timestamp
-                    """, (instrument, start_ts, current_timestamp))
-                    
-                    prices = pd.DataFrame(cur.fetchall(), columns=['timestamp', 'close'])
-                    
-                    if len(prices) > 1:
-                        returns = padded_log_return(prices['close'].values)
-                        # Get the most recent return
-                        if len(returns) > 0:
-                            all_returns[instrument] = returns[-1]
+        # Fetch all prices in a batch
+        try:
+            with conn.cursor() as cur:
+                # Use array_agg to get arrays of values per instrument
+                cur.execute("""
+                    SELECT instrument_name, 
+                           array_agg(close ORDER BY timestamp) as prices,
+                           array_agg(timestamp ORDER BY timestamp) as timestamps
+                    FROM historical_ohlcv_data
+                    WHERE instrument_name = ANY(%s)
+                    AND timestamp BETWEEN %s AND %s
+                    GROUP BY instrument_name
+                """, (instruments, start_ts, current_timestamp))
                 
-                # Get funding rate
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT interest_1h
-                        FROM historical_funding_rates
-                        WHERE instrument_name = %s
-                        AND timestamp <= %s
-                        ORDER BY timestamp DESC
-                        LIMIT 1
-                    """, (instrument, current_timestamp))
-                    result = cur.fetchone()
-                    if result and result[0] is not None:
-                        all_funding[instrument] = result[0]
+                for row in cur.fetchall():
+                    instrument, prices, timestamps = row
+                    
+                    if prices and len(prices) > 1:
+                        # Calculate return from last two prices
+                        last_return = np.log(prices[-1] / prices[-2]) if prices[-2] > 0 else 0
+                        all_returns[instrument] = last_return
+        except Exception as e:
+            logger.error(f"Error fetching prices batch: {e}")
+            # Fall back to individual queries if the optimized query fails
+            for instrument in instruments:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT close
+                            FROM historical_ohlcv_data
+                            WHERE instrument_name = %s
+                            AND timestamp <= %s
+                            ORDER BY timestamp DESC
+                            LIMIT 2
+                        """, (instrument, current_timestamp))
                         
-            except Exception as e:
-                logger.error(f"Error getting data for {instrument}: {e}")
+                        prices = [row[0] for row in cur.fetchall()]
+                        if len(prices) == 2 and prices[1] > 0:
+                            # prices[0] is the latest, prices[1] is the previous
+                            all_returns[instrument] = np.log(prices[0] / prices[1])
+                except Exception as inner_e:
+                    logger.error(f"Error getting prices for {instrument}: {inner_e}")
         
+        # Fetch all funding rates in a single query
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    WITH latest_funding AS (
+                        SELECT DISTINCT ON (instrument_name) 
+                            instrument_name, interest_1h
+                        FROM historical_funding_rates
+                        WHERE instrument_name = ANY(%s)
+                        AND timestamp <= %s
+                        ORDER BY instrument_name, timestamp DESC
+                    )
+                    SELECT instrument_name, interest_1h FROM latest_funding
+                """, (instruments, current_timestamp))
+                
+                for instrument, interest_1h in cur.fetchall():
+                    if interest_1h is not None:
+                        all_funding[instrument] = interest_1h
+        except Exception as e:
+            logger.error(f"Error fetching funding batch: {e}")
+            # Fall back to individual queries if the optimized query fails
+            for instrument in instruments:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT interest_1h
+                            FROM historical_funding_rates
+                            WHERE instrument_name = %s
+                            AND timestamp <= %s
+                            ORDER BY timestamp DESC
+                            LIMIT 1
+                        """, (instrument, current_timestamp))
+                        result = cur.fetchone()
+                        if result and result[0] is not None:
+                            all_funding[instrument] = result[0]
+                except Exception as inner_e:
+                    logger.error(f"Error getting funding for {instrument}: {inner_e}")
+                        
         return all_returns, all_funding
     except Exception as e:
         logger.error(f"Error in load_all_instrument_returns: {e}")
+        logger.error(traceback.format_exc())
         return {}, {}
 
 # --- Compute relative rankings
@@ -393,9 +442,9 @@ def calculate_future_returns_and_labels(df: pd.DataFrame, instrument_name: str) 
         quantiles = valid_returns.quantile([1/3, 2/3]).values
         
         # Assign classes based on global percentiles - ensures exact 33/33/33 split
-        # UPDATED: Using 0, 1, 2 instead of -1, 0, 1
+        # Using 0, 1, 2 for consistent labels
         df['direction_class'] = 1  # Default to neutral (middle)
-        df.loc[df['future_return_1bar'] <= quantiles[0], 'direction_class'] = 0  # Bottom third → down (was -1)
+        df.loc[df['future_return_1bar'] <= quantiles[0], 'direction_class'] = 0  # Bottom third → down
         df.loc[df['future_return_1bar'] >= quantiles[1], 'direction_class'] = 2  # Top third → up
     else:
         df['direction_class'] = 1  # Default if no valid returns
@@ -452,11 +501,10 @@ def calculate_future_returns_and_labels(df: pd.DataFrame, instrument_name: str) 
     # Calculate the final threshold for signal detection
     vol_thresh = threshold_factor * df['volatility_20bar']
     
-    # Generate trading signals
-    # UPDATED: Using 0, 1, 2 instead of -1, 0, 1
+    # Generate trading signals using 0, 1, 2 for consistent labeling
     df['direction_signal'] = 1  # Default to neutral
-    df.loc[df['future_return_1bar'] > vol_thresh, 'direction_signal'] = 2  # Up signal (was 1)
-    df.loc[df['future_return_1bar'] < -vol_thresh, 'direction_signal'] = 0  # Down signal (was -1)
+    df.loc[df['future_return_1bar'] > vol_thresh, 'direction_signal'] = 2  # Up signal
+    df.loc[df['future_return_1bar'] < -vol_thresh, 'direction_signal'] = 0  # Down signal
     
     # --------------------------------------------------------------------
     # 3. SIGNAL_CONFIDENCE: Normalized magnitude for flexible decisions
@@ -544,6 +592,7 @@ def compute_features_for_instrument(conn, instrument_name: str):
             df['funding_spread'] = df['funding_1h'] - (df['funding_8h'] / 8)
             
             # FIX: Handle NaN values before converting to integer type
+            # Keep funding_direction as -1,0,1 since it represents sign, not a class
             df['funding_direction'] = np.sign(df['funding_1h'].fillna(0)).astype('int8')
             
             df['cumulative_funding_4h'] = df['funding_1h'].rolling(4).sum().fillna(0)
@@ -660,11 +709,13 @@ def compute_features_for_instrument(conn, instrument_name: str):
         # Add instrument name
         df['instrument_name'] = instrument_name
         
-        # NEW: Calculate future returns and advanced labels using the state-of-the-art approach
-        df = calculate_future_returns_and_labels(df, instrument_name)
-        
-        # Add instrument name
-        df['instrument_name'] = instrument_name
+        # Calculate future returns and advanced labels
+        try:
+            df = calculate_future_returns_and_labels(df, instrument_name)
+        except Exception as e:
+            logger.error(f"❌ Error calculating labels for {instrument_name}: {e}")
+            logger.error(traceback.format_exc())
+            return
         
         # Keep only allowed columns and drop any remaining NaN rows
         keep_cols = [
@@ -682,7 +733,7 @@ def compute_features_for_instrument(conn, instrument_name: str):
             "relative_return_rank", "relative_funding_rank",
             "hour_of_day_sin", "hour_of_day_cos", "day_of_week_sin", "day_of_week_cos",
             "is_weekend", "mins_to_next_funding",
-            # NEW: Add the new columns for future returns and advanced dual labels
+            # Future returns and advanced dual labels
             "future_return_1bar", "future_return_2bar", "future_return_4bar",
             "future_volatility", "direction_class", "direction_signal", "return_quantile_rank",
             "volatility_20bar", "signal_confidence"
@@ -715,7 +766,13 @@ def compute_features_for_instrument(conn, instrument_name: str):
             
     except Exception as e:
         logger.error(f"❌ Error computing features for {instrument_name}: {e}")
-        traceback.print_exc()
+        logger.error(traceback.format_exc())
+        
+        # Try to commit any pending transactions to prevent database locks
+        try:
+            conn.rollback()
+        except:
+            pass
 
 # --- Write to DB
 def write_features_to_db(conn, df: pd.DataFrame):
@@ -780,7 +837,53 @@ def write_features_to_db(conn, df: pd.DataFrame):
     except Exception as e:
         conn.rollback()
         logger.error(f"❌ Error inserting data: {e}")
-        traceback.print_exc()
+        logger.error(traceback.format_exc())
+
+# --- Manage database indexes
+def manage_indexes(conn, disable=True):
+    """
+    Enable or disable indexes on the model_features_15m_tier1 table.
+    
+    Args:
+        conn: Database connection
+        disable: True to disable indexes, False to recreate them
+    
+    Returns:
+        True if operation succeeded, False otherwise
+    """
+    try:
+        with conn.cursor() as cur:
+            # Set autovacuum based on disable parameter
+            cur.execute(f"ALTER TABLE model_features_15m_tier1 SET (autovacuum_enabled = {not disable})")
+            
+            # Get all indexes except primary key
+            cur.execute("""
+                SELECT indexname FROM pg_indexes 
+                WHERE tablename = 'model_features_15m_tier1' 
+                AND indexname NOT LIKE '%pkey%'
+            """)
+            indexes = [row[0] for row in cur.fetchall()]
+            
+            if disable:
+                # Drop indexes
+                for idx in indexes:
+                    logger.info(f"Dropping index: {idx}")
+                    cur.execute(f"DROP INDEX IF EXISTS {idx}")
+            else:
+                # Recreate indexes
+                logger.info("Recreating indexes...")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_model_features_timestamp ON model_features_15m_tier1 (timestamp)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_model_features_instrument_timestamp ON model_features_15m_tier1 (instrument_name, timestamp)")
+                
+                # Analyze table
+                cur.execute("ANALYZE model_features_15m_tier1")
+        
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to {'disable' if disable else 'recreate'} indexes: {e}")
+        logger.error(traceback.format_exc())
+        return False
 
 # --- Main Entrypoint
 def main():
@@ -791,103 +894,68 @@ def main():
     
     # For single instrument mode, we don't need parallelism
     if args.instrument:
-        conn = get_connection()
-        try:
-            logger.info(f"Processing single instrument: {args.instrument}")
-            compute_features_for_instrument(conn, args.instrument)
-        except Exception as e:
-            logger.exception(f"❌ Error computing features for {args.instrument}: {e}")
-        finally:
-            conn.close()
-            logger.info("🔌 Database connection closed")
+        with db_connection() as conn:
+            try:
+                logger.info(f"Processing single instrument: {args.instrument}")
+                compute_features_for_instrument(conn, args.instrument)
+            except Exception as e:
+                logger.exception(f"❌ Error computing features for {args.instrument}: {e}")
         return
     
     # For multiple instruments, use parallel processing
-    conn = get_connection()
-    try:
-        # Get list of instruments
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT instrument_name FROM instruments 
-                WHERE used = TRUE ORDER BY instrument_name
-            """)
-            instruments = [row[0] for row in cur.fetchall()]
-        
-        logger.info(f"Found {len(instruments)} instruments to process")
-        logger.info(f"Running in {COMPUTE_MODE} mode with window size {ROLLING_WINDOW}")
-        logger.info(f"Using {args.threads} parallel threads")
-        
-        # Temporarily disable indexes for full backfill mode
-        indexes_disabled = False
-        if COMPUTE_MODE == 'full_backfill':
-            try:
-                logger.info("Temporarily disabling indexes for faster bulk loading...")
-                with conn.cursor() as cur:
-                    # Disable autovacuum
-                    cur.execute("ALTER TABLE model_features_15m_tier1 SET (autovacuum_enabled = false)")
-                    # Get all indexes except primary key
-                    cur.execute("""
-                        SELECT indexname FROM pg_indexes 
-                        WHERE tablename = 'model_features_15m_tier1' 
-                        AND indexname NOT LIKE '%pkey%'
-                    """)
-                    indexes = [row[0] for row in cur.fetchall()]
-                    for idx in indexes:
-                        logger.info(f"Dropping index: {idx}")
-                        cur.execute(f"DROP INDEX IF EXISTS {idx}")
-                conn.commit()
-                indexes_disabled = True
-                logger.info("Indexes disabled, proceeding with bulk loading")
-            except Exception as e:
-                logger.warning(f"Failed to disable indexes: {e}")
-                # Continue even if we couldn't disable indexes
-        
-        # Each thread needs its own DB connection, so we create a function that opens one
-        def process_instrument(symbol):
-            # Get a new connection for this thread
-            conn = get_connection()
-            try:
-                compute_features_for_instrument(conn, symbol)
-                return f"✅ Completed {symbol}"
-            except Exception as e:
-                logger.exception(f"❌ Error computing features for {symbol}: {e}")
-                return f"❌ Failed {symbol}: {str(e)}"
-            finally:
-                conn.close()
-        
-        # Process instruments in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            futures = [executor.submit(process_instrument, symbol) for symbol in instruments]
+    with db_connection() as conn:
+        try:
+            # Get list of instruments
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT instrument_name FROM instruments 
+                    WHERE used = TRUE ORDER BY instrument_name
+                """)
+                instruments = [row[0] for row in cur.fetchall()]
             
-            # Wait for all to complete and handle any exceptions
-            for future in futures:
-                result = future.result()  # This will re-raise any exceptions
-                logger.info(result)
+            logger.info(f"Found {len(instruments)} instruments to process")
+            logger.info(f"Running in {COMPUTE_MODE} mode with window size {ROLLING_WINDOW}")
+            logger.info(f"Using {args.threads} parallel threads")
+            
+            # Temporarily disable indexes for full backfill mode
+            indexes_disabled = False
+            if COMPUTE_MODE == 'full_backfill':
+                indexes_disabled = manage_indexes(conn, disable=True)
+                if indexes_disabled:
+                    logger.info("Indexes disabled, proceeding with bulk loading")
+            
+            # Each thread needs its own DB connection, so we create a function that opens one
+            def process_instrument(symbol):
+                # Get a new connection for this thread
+                with db_connection() as thread_conn:
+                    try:
+                        compute_features_for_instrument(thread_conn, symbol)
+                        return f"✅ Completed {symbol}"
+                    except Exception as e:
+                        logger.exception(f"❌ Error computing features for {symbol}: {e}")
+                        return f"❌ Failed {symbol}: {str(e)}"
+            
+            # Process instruments in parallel using ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=args.threads) as executor:
+                futures = [executor.submit(process_instrument, symbol) for symbol in instruments]
                 
-        logger.info(f"✅ All instruments processed using {args.threads} threads")
-        
-        # After all processing is complete, recreate indexes if we disabled them
-        if indexes_disabled:
-            try:
-                logger.info("Recreating indexes...")
-                with conn.cursor() as cur:
-                    # Recreate typical indexes for this kind of data
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_model_features_timestamp ON model_features_15m_tier1 (timestamp)")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_model_features_instrument_timestamp ON model_features_15m_tier1 (instrument_name, timestamp)")
+                # Wait for all to complete and handle any exceptions
+                for future in futures:
+                    result = future.result()  # This will re-raise any exceptions
+                    logger.info(result)
                     
-                    # Analyze table and re-enable autovacuum
-                    cur.execute("ANALYZE model_features_15m_tier1")
-                    cur.execute("ALTER TABLE model_features_15m_tier1 SET (autovacuum_enabled = true)")
-                conn.commit()
-                logger.info("Indexes recreated and autovacuum re-enabled")
-            except Exception as e:
-                logger.error(f"Failed to recreate indexes: {e}")
+            logger.info(f"✅ All instruments processed using {args.threads} threads")
+            
+            # After all processing is complete, recreate indexes if we disabled them
+            if indexes_disabled:
+                logger.info("Recreating indexes...")
+                if manage_indexes(conn, disable=False):
+                    logger.info("Indexes recreated and autovacuum re-enabled")
+                else:
+                    logger.error("Failed to recreate indexes")
                 
-    except Exception as e:
-        logger.exception(f"❌ Error in main process: {e}")
-    finally:
-        conn.close()
-        logger.info("🔌 Database connection closed")
+        except Exception as e:
+            logger.exception(f"❌ Error in main process: {e}")
 
 if __name__ == "__main__":
     main()

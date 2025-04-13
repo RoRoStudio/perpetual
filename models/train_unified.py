@@ -22,6 +22,13 @@ import gc
 import pyarrow.parquet as pq
 import json
 import tempfile
+import traceback
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO,
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("train_unified")
 
 # Add project root to path for imports
 sys.path.append('/mnt/p/perpetual')
@@ -67,83 +74,116 @@ class FastDataset:
         all_train_targets = []
         all_test_features = []
         all_test_targets = []
-        # NEW: Add lists for asset IDs
+        # Add lists for asset IDs
         all_train_asset_ids = []
         all_test_asset_ids = []
         
         for instrument in self.instruments:
             # Try to load from Parquet (faster)
             parquet_path = f"/mnt/p/perpetual/cache/tier1_{instrument}.parquet"
-            if os.path.exists(parquet_path):
-                print(f"Loading data from Parquet for {instrument}")
-                # Load using PyArrow with memory mapping for efficiency
-                table = pq.read_table(parquet_path, memory_map=True)
-                df = table.to_pandas()
+            if not os.path.exists(parquet_path):
+                logger.warning(f"⚠️ Warning: Parquet file not found for {instrument}. Run 'python -m features.export_parquet' first.")
+                continue
                 
-                # Use the pre-computed forward-looking metrics directly
-                # These are already in our database from compute_tier1.py
-                df['next_volatility'] = df['future_volatility']
-                # For backward compatibility, ensure these columns exist
-                if 'future_return_1bar' not in df.columns:
-                    print(f"Warning: 'future_return_1bar' not found in data, using fallback")
-                    df['future_return_1bar'] = df['return_1bar'].shift(-1)
-                    df['future_return_2bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2)
-                    df['future_return_4bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2) + \
-                                          df['return_1bar'].shift(-3) + df['return_1bar'].shift(-4)
-                    df['future_volatility'] = df['return_1bar'].rolling(4).std().shift(-4)
-                    df['signal_confidence'] = 1.0  # Default confidence
+            logger.info(f"Loading data from Parquet for {instrument}")
+            # Load using PyArrow with memory mapping for efficiency
+            table = pq.read_table(parquet_path, memory_map=True)
+            df = table.to_pandas()
+            
+            # Validate expected columns are present
+            missing_labels = [col for col in self.label_columns if col not in df.columns]
+            if missing_labels:
+                logger.warning(f"⚠️ Missing label columns for {instrument}: {missing_labels}")
+                if "direction_class" in missing_labels:
+                    # Critical column is missing - skip this instrument
+                    logger.warning(f"⚠️ Skipping {instrument} due to missing direction_class column")
+                    continue
                 
-                # Fill NaNs
-                for col in self.label_columns:
+            # For backward compatibility, ensure these columns exist
+            if 'future_return_1bar' not in df.columns:
+                logger.warning(f"Warning: 'future_return_1bar' not found in data, using fallback")
+                df['future_return_1bar'] = df['return_1bar'].shift(-1)
+                df['future_return_2bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2)
+                df['future_return_4bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2) + \
+                                      df['return_1bar'].shift(-3) + df['return_1bar'].shift(-4)
+                df['future_volatility'] = df['return_1bar'].rolling(4).std().shift(-4)
+                df['signal_confidence'] = 1.0  # Default confidence
+            
+            # Fill NaNs
+            for col in self.label_columns:
+                if col in df.columns:
                     df.loc[df.index[-4:], col] = 0
-                
-                # Store feature columns if not already set
-                if self.feature_columns is None:
-                    # Select all columns except targets and metadata
-                    exclude_cols = self.label_columns + ['instrument_name', 'timestamp']
-                    self.feature_columns = [col for col in df.columns if col not in exclude_cols]
-                
-                # Apply transformation
-                transformer = FeatureTransformer(instrument)
-                features_df = transformer.transform(df[self.feature_columns])
-                targets_df = df[self.label_columns]
-                
-                # Create sequences
-                features, targets = self._create_sequences(features_df, targets_df)
-                
-                # Split into train/test
-                split_idx = int(len(features) * (1 - self.test_size))
-                train_features = features[:split_idx]
-                train_targets = targets[:split_idx]
-                test_features = features[split_idx:]
-                test_targets = targets[split_idx:]
-                
-                # Add to list
-                all_train_features.append(train_features)
-                all_train_targets.append(train_targets)
-                all_test_features.append(test_features)
-                all_test_targets.append(test_targets)
-                
-                # NEW: Add these lines to create and store asset IDs
-                instrument_id = self.asset_ids.get(instrument, 0)
-                train_asset_ids = torch.full((len(train_features),), instrument_id, dtype=torch.long)
-                test_asset_ids = torch.full((len(test_features),), instrument_id, dtype=torch.long)
-                all_train_asset_ids.append(train_asset_ids)
-                all_test_asset_ids.append(test_asset_ids)
+            
+            # Store feature columns if not already set
+            if self.feature_columns is None:
+                # Select all columns except targets and metadata
+                exclude_cols = self.label_columns + ['instrument_name', 'timestamp']
+                self.feature_columns = [col for col in df.columns if col not in exclude_cols]
+            
+            # Apply transformation
+            transformer = FeatureTransformer(instrument)
+            
+            # Add validation for columns
+            missing_features = transformer.validate_feature_columns(df.columns)
+            if missing_features:
+                for col in missing_features:
+                    df[col] = 0.0  # Add missing columns with default values
+                    
+            features_df = transformer.transform(df[self.feature_columns])
+            
+            # Validate target columns exist
+            available_targets = [col for col in self.label_columns if col in df.columns]
+            targets_df = df[available_targets]
+            
+            # Validate that direction_class is using 0,1,2 schema
+            if 'direction_class' in targets_df.columns:
+                unique_classes = targets_df['direction_class'].unique()
+                contains_negative = any(x < 0 for x in unique_classes if pd.notna(x))
+                if contains_negative:
+                    logger.warning(f"⚠️ Found old class schema (-1,0,1) in {instrument}. Converting to 0,1,2")
+                    # Convert -1 to 0, 0 to 1, 1 to 2
+                    targets_df['direction_class'] = targets_df['direction_class'] + 1
+            
+            # Create sequences
+            features, targets = self._create_sequences(features_df, targets_df)
+            
+            # Split into train/test
+            split_idx = int(len(features) * (1 - self.test_size))
+            train_features = features[:split_idx]
+            train_targets = targets[:split_idx]
+            test_features = features[split_idx:]
+            test_targets = targets[split_idx:]
+            
+            # Add to list
+            all_train_features.append(train_features)
+            all_train_targets.append(train_targets)
+            all_test_features.append(test_features)
+            all_test_targets.append(test_targets)
+            
+            # Add these lines to create and store asset IDs
+            instrument_id = self.asset_ids.get(instrument, 0)
+            train_asset_ids = torch.full((len(train_features),), instrument_id, dtype=torch.long)
+            test_asset_ids = torch.full((len(test_features),), instrument_id, dtype=torch.long)
+            all_train_asset_ids.append(train_asset_ids)
+            all_test_asset_ids.append(test_asset_ids)
+        
+        # Ensure we have data to work with
+        if not all_train_features:
+            raise ValueError("No valid data found for any instruments!")
         
         # Concatenate all data
-        train_features = torch.cat(all_train_features) if all_train_features else torch.tensor([])
-        train_targets = torch.cat(all_train_targets) if all_train_targets else torch.tensor([])
-        test_features = torch.cat(all_test_features) if all_test_features else torch.tensor([])
-        test_targets = torch.cat(all_test_targets) if all_test_targets else torch.tensor([])
+        train_features = torch.cat(all_train_features)
+        train_targets = torch.cat(all_train_targets)
+        test_features = torch.cat(all_test_features)
+        test_targets = torch.cat(all_test_targets)
         
-        # NEW: Concatenate asset IDs
-        train_asset_ids = torch.cat(all_train_asset_ids) if all_train_asset_ids else torch.tensor([])
-        test_asset_ids = torch.cat(all_test_asset_ids) if all_test_asset_ids else torch.tensor([])
+        # Concatenate asset IDs
+        train_asset_ids = torch.cat(all_train_asset_ids)
+        test_asset_ids = torch.cat(all_test_asset_ids)
         
-        print(f"✅ Loaded {len(train_features)} training and {len(test_features)} test samples")
+        logger.info(f"✅ Loaded {len(train_features)} training and {len(test_features)} test samples")
         
-        # NEW: Return asset IDs as part of the data tuples
+        # Return asset IDs as part of the data tuples
         return (train_features, train_targets, train_asset_ids), (test_features, test_targets, test_asset_ids)
     
     def _create_sequences(self, features_df, targets_df):
@@ -151,7 +191,7 @@ class FastDataset:
         # Make sure all features are numeric
         for col in features_df.columns:
             if features_df[col].dtype == 'object':
-                print(f"Warning: Converting object column {col} to float")
+                logger.warning(f"Warning: Converting object column {col} to float")
                 features_df[col] = pd.to_numeric(features_df[col], errors='coerce')
         
         # Convert to numpy arrays, ensuring float32 dtype
@@ -162,8 +202,8 @@ class FastDataset:
         num_sequences = len(features_array) - self.seq_length + 1
         
         # Log dimensions for debugging
-        print(f"Features shape: {features_array.shape}, Targets shape: {targets_array.shape}")
-        print(f"Creating {num_sequences} sequences of length {self.seq_length}")
+        logger.info(f"Features shape: {features_array.shape}, Targets shape: {targets_array.shape}")
+        logger.info(f"Creating {num_sequences} sequences of length {self.seq_length}")
         
         # Pre-allocate tensors for better performance
         feature_sequences = torch.zeros((num_sequences, self.seq_length, features_array.shape[1]), 
@@ -189,7 +229,7 @@ class FastDataset:
         # Use TensorDataset for better performance
         from torch.utils.data import TensorDataset
         
-        # NEW: Include asset_ids in the datasets
+        # Include asset_ids in the datasets
         train_dataset = TensorDataset(self.train_data[0], self.train_data[1], self.train_data[2])
         test_dataset = TensorDataset(self.test_data[0], self.test_data[1], self.test_data[2])
         
@@ -201,8 +241,8 @@ class FastDataset:
             num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
-            persistent_workers=True,
-            prefetch_factor=2,
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None,
         )
         
         test_loader = DataLoader(
@@ -211,11 +251,45 @@ class FastDataset:
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2,
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=2 if num_workers > 0 else None,
         )
         
         return train_loader, test_loader
+
+def validate_config(model_params, training_params):
+    """Validate configuration parameters for common errors"""
+    issues = []
+    
+    # Check transformer dimensions
+    if model_params.get('transformer_dim', 0) % 2 != 0:
+        issues.append(f"transformer_dim must be even, got {model_params.get('transformer_dim')}")
+        model_params['transformer_dim'] = model_params['transformer_dim'] + 1
+        
+    # Check that transformer_heads divides transformer_dim
+    if model_params.get('transformer_dim', 0) % model_params.get('transformer_heads', 1) != 0:
+        issues.append(f"transformer_dim ({model_params.get('transformer_dim')}) must be divisible by transformer_heads ({model_params.get('transformer_heads')})")
+        # Adjust heads to be a divisor
+        for h in range(model_params.get('transformer_heads', 8), 0, -1):
+            if model_params.get('transformer_dim', 0) % h == 0:
+                model_params['transformer_heads'] = h
+                break
+    
+    # Check sequence length is reasonable
+    if training_params.get('seq_length', 0) < 8:
+        issues.append(f"seq_length too small: {training_params.get('seq_length')}")
+        training_params['seq_length'] = 8
+    
+    # Check batch size
+    if training_params.get('batch_size', 0) < 1:
+        issues.append(f"Invalid batch_size: {training_params.get('batch_size')}")
+        training_params['batch_size'] = 16
+        
+    # Add warnings for any issues
+    for issue in issues:
+        logger.warning(f"⚠️ Configuration issue: {issue}")
+    
+    return len(issues) == 0
 
 def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device, 
           num_epochs=1, patience=3, gradient_accumulation=1, model_save_path="./models", 
@@ -225,8 +299,8 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
     """
     Simplified training function with essential optimizations
     """
-    print(f"🚀 Starting training on {device} with mixed precision")
-    print(f"📊 Using batch size {train_loader.dataset.tensors[0].shape[0] // len(train_loader)}")
+    logger.info(f"🚀 Starting training on {device} with mixed precision")
+    logger.info(f"📊 Using batch size {train_loader.dataset.tensors[0].shape[0] // len(train_loader)}")
     
     # Define loss functions
     direction_criterion = nn.CrossEntropyLoss()
@@ -268,12 +342,13 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
             # Move to device with non_blocking for better performance
             features = features.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            # NEW: Move asset_ids to device
+            # Move asset_ids to device
             asset_ids = asset_ids.to(device, non_blocking=True)
             
             # Extract both direction_class and direction_signal for dual training
-            direction_class = targets[:, 3].long()  # Already 0,1,2 in database
-            direction_signal = targets[:, 4].long()  # Also 0,1,2 in database
+            # Both are now using 0,1,2 for consistent labeling
+            direction_class = targets[:, 3].long()  # 0=down, 1=neutral, 2=up
+            direction_signal = targets[:, 4].long()  # 0=down, 1=neutral, 2=up
             future_return = targets[:, 0].unsqueeze(1)
             future_volatility = targets[:, 5].unsqueeze(1)
             signal_confidence = targets[:, 6].unsqueeze(1)
@@ -283,7 +358,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
                 # Create funding rate (but use real asset_ids now)
                 funding_rate = torch.zeros(features.size(0), 1, device=device)
                 
-                # NEW: Use asset_ids instead of None
+                # Use asset_ids instead of None
                 outputs = model(features, funding_rate, asset_ids)
                 
                 # Compute losses with dual objectives
@@ -305,16 +380,22 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
             
             # Only update weights after accumulating gradients
             if (batch_idx + 1) % gradient_accumulation == 0 or (batch_idx + 1 == len(train_loader)):
+                if profiler:
+                    profiler.start_operation("optimizer_step")
+                    
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad
+                optimizer.zero_grad(set_to_none=True)  # set_to_none=True is faster than setting to zero
                 if scheduler:
                     scheduler.step()
+                
+                if profiler:
+                    profiler.end_operation("optimizer_step")
             
             # Record metrics
-            train_losses.append(loss.item() * (gradient_accumulation if gradient_accumulation > 1 else 1))
+            train_losses.append(loss.item() * (gradient_accumulation if gradient_accumulation > 1 else 1))  # Rescale loss back
             
             # Calculate accuracy
             pred_direction = torch.argmax(outputs['direction_logits'], dim=1)
@@ -350,12 +431,12 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
                 # Move to device
                 features = features.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
-                # NEW: Move asset_ids to device
+                # Move asset_ids to device
                 asset_ids = asset_ids.to(device, non_blocking=True)
                 
-                # Extract both direction_class and direction_signal for dual evaluation
-                direction_class = targets[:, 3].long()  # Already 0,1,2 in database
-                direction_signal = targets[:, 4].long()  # Also 0,1,2 in database
+                # Extract direction_class using 0,1,2 schema
+                direction_class = targets[:, 3].long()  # 0=down, 1=neutral, 2=up
+                direction_signal = targets[:, 4].long()  # 0=down, 1=neutral, 2=up
                 future_return = targets[:, 0].unsqueeze(1)
                 future_volatility = targets[:, 5].unsqueeze(1)
                 signal_confidence = targets[:, 6].unsqueeze(1)
@@ -363,7 +444,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
                 # Create funding rate
                 funding_rate = torch.zeros(features.size(0), 1, device=device)
                 
-                # NEW: Use asset_ids instead of None
+                # Use asset_ids instead of None
                 with autocast():
                     outputs = model(features, funding_rate, asset_ids)
                     
@@ -392,7 +473,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
         epoch_duration = time.time() - epoch_start_time
         
         # Print epoch results
-        print(f"Epoch {epoch+1}/{num_epochs} - "
+        logger.info(f"Epoch {epoch+1}/{num_epochs} - "
               f"Time: {epoch_duration:.2f}s - "
               f"Train Loss: {train_loss:.6f} - "
               f"Val Loss: {val_loss:.6f} - "
@@ -438,7 +519,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
                     "feature_columns": list(feature_columns)
                 }, f, indent=2)
 
-            print(f"✅ Model improved! Saved to {checkpoint_path}")
+            logger.info(f"✅ Model improved! Saved to {checkpoint_path}")
             
             # Save to W&B
             if use_wandb:
@@ -451,7 +532,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
         
         # Early stopping check
         if patience_counter >= patience:
-            print(f"⚠️ Early stopping triggered after {epoch+1} epochs")
+            logger.info(f"⚠️ Early stopping triggered after {epoch+1} epochs")
             break
         
         if profiler:
@@ -466,7 +547,7 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
         'val_loss': val_loss,
     }, final_checkpoint_path)
     
-    print(f"✅ Training complete! Final model saved to {final_checkpoint_path}")
+    logger.info(f"✅ Training complete! Final model saved to {final_checkpoint_path}")
     
     # Save to W&B
     if use_wandb:
@@ -537,13 +618,13 @@ def main():
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
                 json.dump(dot_config, f, indent=2)
                 args.sweep_config = f.name
-                print(f"Created temporary sweep config from dot notation parameters: {args.sweep_config}")
+                logger.info(f"Created temporary sweep config from dot notation parameters: {args.sweep_config}")
     
     # Initialize profiler if enabled
     profiler = None
     if args.profile:
         profiler = TrainingProfiler("/mnt/p/perpetual/tmp")
-        print("🔍 Performance profiling enabled")
+        logger.info("🔍 Performance profiling enabled")
     
     # Use W&B unless explicitly disabled
     use_wandb = not args.no_wandb
@@ -571,7 +652,8 @@ def main():
                     # Otherwise use the first instrument
                     instruments = [instruments[0]]
         except Exception as e:
-            print(f"Error fetching instruments: {e}")
+            logger.error(f"Error fetching instruments: {e}")
+            logger.error(traceback.format_exc())
             raise  # Re-raise exception to halt execution
         finally:
             conn.close()
@@ -598,61 +680,72 @@ def main():
                 model_params['transformer_dim'] = model_params['transformer_dim'] + (model_params['transformer_dim'] % 2)
                 
             max_speed = sweep_config.get('max_speed', args.max_speed)
-            print(f"Loaded sweep config with {len(model_params)} model parameters and {len(training_params)} training parameters")
+            logger.info(f"Loaded sweep config with {len(model_params)} model parameters and {len(training_params)} training parameters")
         except Exception as e:
-            print(f"Error parsing sweep config: {e}, using defaults")
+            logger.error(f"Error parsing sweep config: {e}")
+            logger.error(traceback.format_exc())
             max_speed = args.max_speed
             # Use defaults for model/training params (set later)
+            model_params = None
+            training_params = None
     else:
         max_speed = args.max_speed
-        # Default parameters for quick-test mode
-        if args.quick_test:
-            model_params = {
-                "tcn_channels": [32, 32],
-                "tcn_kernel_size": 3,
-                "transformer_dim": 32,
-                "transformer_heads": 2,
-                "transformer_layers": 2,
-                "dropout": 0.2,
-                "max_seq_length": 512
-            }
-            
-            training_params = {
-                "seq_length": 32,
-                "batch_size": 32,
-                "learning_rate": 0.001,
-                "weight_decay": 0.0001,
-                "num_epochs": 1,
-                "patience": 3,
-                "gradient_accumulation": 1,
-                "num_workers": 2
-            }
-        else:
-            # Default parameters for standard mode
-            model_params = {
-                "tcn_channels": [64, 64],  # Smaller but still effective
-                "tcn_kernel_size": 3,
-                "transformer_dim": 64,
-                "transformer_heads": 4,
-                "transformer_layers": 2,
-                "dropout": 0.2,
-                "max_seq_length": 512
-            }
-            
-            training_params = {
-                "seq_length": 64,
-                "batch_size": 64,
-                "learning_rate": 0.001,
-                "weight_decay": 0.0001,
-                "num_epochs": 10,
-                "patience": 3,
-                "gradient_accumulation": 1,
-                "num_workers": 4
-            }
+        model_params = None
+        training_params = None
+        
+    # Default parameters for quick-test mode
+    if args.quick_test:
+        model_params = model_params or {
+            "tcn_channels": [32, 32],
+            "tcn_kernel_size": 3,
+            "transformer_dim": 32,
+            "transformer_heads": 2,
+            "transformer_layers": 2,
+            "dropout": 0.2,
+            "max_seq_length": 512
+        }
+        
+        training_params = training_params or {
+            "seq_length": 32,
+            "batch_size": 32,
+            "learning_rate": 0.001,
+            "weight_decay": 0.0001,
+            "num_epochs": 1,
+            "patience": 3,
+            "gradient_accumulation": 1,
+            "num_workers": 2
+        }
+    else:
+        # Default parameters for standard mode
+        model_params = model_params or {
+            "tcn_channels": [64, 64],  # Smaller but still effective
+            "tcn_kernel_size": 3,
+            "transformer_dim": 64,
+            "transformer_heads": 4,
+            "transformer_layers": 2,
+            "dropout": 0.2,
+            "max_seq_length": 512
+        }
+        
+        training_params = training_params or {
+            "seq_length": 64,
+            "batch_size": 64,
+            "learning_rate": 0.001,
+            "weight_decay": 0.0001,
+            "num_epochs": 10,
+            "patience": 3,
+            "gradient_accumulation": 1,
+            "num_workers": 4
+        }
     
+    # Validate configuration
+    valid_config = validate_config(model_params, training_params)
+    if not valid_config:
+        logger.warning("⚠️ Configuration was adjusted to fix issues.")
+        
     # Set device
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
     
     # Initialize W&B
     if use_wandb:
@@ -696,7 +789,7 @@ def main():
         **model_params
     ).to(device)
 
-    print(f"🧠 Instantiated model: {model_name}")
+    logger.info(f"🧠 Instantiated model: {model_name}")
 
     
     # Initialize optimizer and scheduler
@@ -719,35 +812,50 @@ def main():
     scaler = GradScaler()
     
     # Print configuration
-    print("\n----- Training Configuration -----")
-    print(f"🧠 Model: {'OptimizedDeribitModel' if max_speed else 'DeribitHybridModel'}")
-    print(f"🔢 Model Parameters: {model_params}")
-    print(f"⚙️ Training Parameters: {training_params}")
-    print(f"💱 Instruments: {instruments}")
-    print(f"📂 Output Directory: {args.output_dir}")
-    print("----------------------------------\n")
+    logger.info("\n----- Training Configuration -----")
+    logger.info(f"🧠 Model: {model_name}")
+    logger.info(f"🔢 Model Parameters: {model_params}")
+    logger.info(f"⚙️ Training Parameters: {training_params}")
+    logger.info(f"💱 Instruments: {instruments}")
+    logger.info(f"📂 Output Directory: {args.output_dir}")
+    logger.info("----------------------------------\n")
     
-    # Train model
-    train(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        device=device,
-        num_epochs=training_params.get('num_epochs', 10),
-        patience=training_params.get('patience', 3),
-        gradient_accumulation=training_params.get('gradient_accumulation', 1),
-        model_save_path=args.output_dir,
-        profiler=profiler,
-        use_wandb=use_wandb,
-        max_speed=max_speed,
-        instruments=instruments,
-        model_params=model_params,
-        training_params=training_params,
-        feature_columns=data.feature_columns
-    )
+    try:
+        # Train model
+        train(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            device=device,
+            num_epochs=training_params.get('num_epochs', 10),
+            patience=training_params.get('patience', 3),
+            gradient_accumulation=training_params.get('gradient_accumulation', 1),
+            model_save_path=args.output_dir,
+            profiler=profiler,
+            use_wandb=use_wandb,
+            max_speed=max_speed,
+            instruments=instruments,
+            model_params=model_params,
+            training_params=training_params,
+            feature_columns=data.feature_columns
+        )
+    except Exception as e:
+        logger.error(f"Error during training: {e}")
+        logger.error(traceback.format_exc())
+        # Try to save a backup model if possible
+        try:
+            emergency_path = f"{args.output_dir}/model_emergency_{timestamp}.pt"
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, emergency_path)
+            logger.info(f"Saved emergency backup to {emergency_path}")
+        except:
+            pass
+        raise
 
     # Clean up temporary config file if we created one
     if unknown and 'tempfile' in locals() and os.path.exists(args.sweep_config):

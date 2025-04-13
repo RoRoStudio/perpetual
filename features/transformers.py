@@ -13,6 +13,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Union, Optional, Any
 import warnings
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -126,6 +127,7 @@ class FeatureTransformer:
             return True
         except Exception as e:
             logger.error(f"Failed to load scalers: {e}")
+            logger.error(traceback.format_exc())
             self.std_scaler = StandardScaler()
             self.minmax_scaler = MinMaxScaler()
             self.metadata = {
@@ -173,6 +175,7 @@ class FeatureTransformer:
             return True
         except Exception as e:
             logger.error(f"Failed to save scalers: {e}")
+            logger.error(traceback.format_exc())
             return False
     
     def _preprocess_for_fitting(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -313,9 +316,16 @@ class FeatureTransformer:
             return False
             
         shift_detected = False
+        total_shift_score = 0
+        monitored_features = 0
         
-        # Compare distribution of key features
-        for feature in ['return_1bar', 'volume_zscore', 'volatility_1h', 'funding_1h']:
+        # Monitor key features for shifts
+        key_features = [
+            'return_1bar', 'volume_zscore', 'volatility_1h', 
+            'funding_1h', 'correlation_with_btc'
+        ]
+        
+        for feature in key_features:
             if feature not in df.columns or feature not in self.metadata['feature_means']:
                 continue
                 
@@ -327,13 +337,22 @@ class FeatureTransformer:
             stored_std = self.metadata['feature_stds'].get(feature, 1)
             
             # Calculate normalized difference
-            if stored_std != 0:
+            if stored_std > 1e-8:  # Avoid division by near-zero values
                 mean_diff = abs(current_mean - stored_mean) / stored_std
+                total_shift_score += mean_diff
+                monitored_features += 1
                 
+                # Log significant individual feature shifts
                 if mean_diff > tolerance:
                     logger.info(f"Distribution shift detected in {feature} for {self.instrument_name}: {mean_diff:.2f} > {tolerance}")
                     shift_detected = True
-                    break
+        
+        # Also check for overall distribution shift across all monitored features
+        if monitored_features > 0:
+            avg_shift_score = total_shift_score / monitored_features
+            if avg_shift_score > tolerance * 0.7:  # Slightly lower threshold for average
+                logger.info(f"Overall distribution shift detected for {self.instrument_name}: {avg_shift_score:.2f}")
+                shift_detected = True
         
         return shift_detected
 
@@ -374,13 +393,14 @@ class FeatureTransformer:
                 return False
         except Exception as e:
             logger.error(f"Error calibrating scaler: {e}")
+            logger.error(traceback.format_exc())
             return False
         finally:
             conn.close()
 
     def transform(self, df: pd.DataFrame, auto_calibrate: bool = True) -> pd.DataFrame:
         """
-        Transform features using fitted scalers, with enhanced numerical stability
+        Transform features using fitted scalers, with enhanced numerical stability and validation
         
         Args:
             df: DataFrame containing raw features
@@ -446,6 +466,7 @@ class FeatureTransformer:
                         result[feature] = scaled_std[:, i]
                 except Exception as e:
                     logger.error(f"Error during standard scaling: {e}")
+                    logger.error(traceback.format_exc())
                     # Fallback for error cases: apply simple standardization
                     for feature in std_features:
                         mean = np.nanmean(std_data[feature])
@@ -491,6 +512,7 @@ class FeatureTransformer:
                         result[feature] = scaled_minmax[:, i]
                 except Exception as e:
                     logger.error(f"Error during minmax scaling: {e}")
+                    logger.error(traceback.format_exc())
                     # Fallback for error cases: apply simple min-max scaling manually
                     for feature in minmax_features:
                         min_val = np.nanmin(minmax_data[feature])
@@ -506,6 +528,18 @@ class FeatureTransformer:
                 if result[col].isna().any() or np.isinf(result[col]).any().any():
                     logger.warning(f"Fixing remaining NaN/Inf values in {col}")
                     result[col] = result[col].replace([np.inf, -np.inf, np.nan], 0)
+        
+        # Validate the range of transformed values
+        for col in result.columns:
+            if col not in ['instrument_name', 'timestamp']:
+                # Check for extreme values that would indicate transformation issues
+                if len(result) > 0:  # Only check if we have data
+                    col_max = result[col].max()
+                    col_min = result[col].min()
+                    
+                    if col_max > 10.0 or col_min < -10.0:
+                        logger.warning(f"Feature '{col}' has extreme values: min={col_min}, max={col_max}")
+                        result[col] = result[col].clip(-10.0, 10.0)
         
         return result
     
@@ -556,6 +590,27 @@ class FeatureTransformer:
                 }
         
         return stats
+
+    def validate_feature_columns(self, available_columns: list) -> list:
+        """
+        Validate that all required feature columns are available.
+        
+        Args:
+            available_columns: List of available feature column names
+            
+        Returns:
+            List of missing columns
+        """
+        required_cols = set(STANDARD_SCALE_FEATURES + MINMAX_SCALE_FEATURES + 
+                          CATEGORICAL_FEATURES + CYCLIC_FEATURES)
+        available_cols = set(available_columns)
+        
+        missing_cols = required_cols - available_cols
+        
+        if missing_cols:
+            logger.warning(f"Missing feature columns for {self.instrument_name}: {missing_cols}")
+            
+        return list(missing_cols)
 
     def preprocess_sequences(self, df: pd.DataFrame, seq_length: int = 64, stride: int = 1) -> np.ndarray:
         """
@@ -633,6 +688,7 @@ class ScalerManager:
                 
         except Exception as e:
             logger.error(f"Error in auto_calibrate_if_needed: {e}")
+            logger.error(traceback.format_exc())
         
         finally:
             conn.close()

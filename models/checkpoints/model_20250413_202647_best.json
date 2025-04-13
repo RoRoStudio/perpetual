@@ -13,21 +13,26 @@
     "XRP_USDC-PERPETUAL"
   ],
   "model_params": {
-    "dropout": 0.1922618458463441,
-    "max_seq_length": 256,
-    "tcn_kernel_size": 5,
-    "transformer_dim": 32,
-    "transformer_heads": 1,
-    "transformer_layers": 1
+    "tcn_channels": [
+      64,
+      64
+    ],
+    "tcn_kernel_size": 3,
+    "transformer_dim": 64,
+    "transformer_heads": 4,
+    "transformer_layers": 2,
+    "dropout": 0.2,
+    "max_seq_length": 512
   },
   "training_params": {
+    "seq_length": 64,
     "batch_size": 64,
-    "gradient_accumulation": 4,
-    "learning_rate": 0.0005648516747763524,
-    "num_epochs": 2,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "num_epochs": 10,
     "patience": 3,
-    "seq_length": 48,
-    "weight_decay": 0.0001472444694453625
+    "gradient_accumulation": 1,
+    "num_workers": 4
   },
   "feature_columns": [
     "return_1bar",
