@@ -7,52 +7,60 @@ parameters:
     distribution: uniform
     min: 0.0
     max: 0.4
+
   model_params.max_seq_length:
-    distribution: int_uniform
-    min: 256
-    max: 1024
+    values: [256, 384, 512, 768]
+
   model_params.tcn_kernel_size:
-    distribution: int_uniform
+    distribution: q_uniform
     min: 2
     max: 6
+    q: 1
+
   model_params.transformer_dim:
-    values: [16, 32, 48, 64, 80, 96, 128]  # Only even values
+    values: [32, 64, 96, 128]
+
   model_params.transformer_heads:
-    distribution: int_uniform
-    min: 1
-    max: 4
+    values: [1, 2, 4, 8]
+
   model_params.transformer_layers:
-    distribution: int_uniform
+    distribution: q_uniform
     min: 1
     max: 4
+    q: 1
+
   training_params.batch_size:
-    distribution: int_uniform
+    distribution: q_uniform
     min: 16
     max: 64
+    q: 16
+
   training_params.gradient_accumulation:
-    distribution: int_uniform
-    min: 1
-    max: 4
+    values: [1, 2, 4]
+
   training_params.learning_rate:
     distribution: uniform
     min: 0.0005
     max: 0.002
+
   training_params.num_epochs:
-    distribution: int_uniform
-    min: 2
-    max: 6
+    values: [2, 3, 4]
+
   training_params.patience:
-    distribution: int_uniform
-    min: 2
-    max: 6
+    values: [1, 2, 3]
+
   training_params.seq_length:
-    distribution: int_uniform
+    distribution: q_uniform
     min: 16
     max: 64
+    q: 16
+
   training_params.weight_decay:
     distribution: uniform
-    min: 5e-05
-    max: 0.0002
+    min: 5e-5
+    max: 2e-4
+
   max_speed:
     values: [true, false]
+
 program: models/train_unified.py

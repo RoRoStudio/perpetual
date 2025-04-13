@@ -564,6 +564,24 @@ class DeribitHybridModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(64, 3)
         )
+
+        # Signal classification head for real trading signals
+        self.signal_head = nn.Sequential(
+            nn.Linear(transformer_dim, 64),
+            nn.LayerNorm(64),
+            nn.Mish(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 3)
+        )
+
+        # Signal confidence prediction
+        self.confidence_head = nn.Sequential(
+            nn.Linear(transformer_dim, 32),
+            nn.LayerNorm(32),
+            nn.Mish(),
+            nn.Linear(32, 1),
+            nn.ReLU()  # Confidence is always positive
+        )
         
         # Return prediction head
         self.return_head = nn.Sequential(
@@ -668,12 +686,17 @@ class DeribitHybridModel(nn.Module):
         # Get portfolio optimization metrics
         portfolio_outputs = self.portfolio_head(gated_features)
         
-        # Combine all outputs
+        # Add signals_logits and confidence predictions to the outputs
+        signal_logits = self.signal_head(gated_features)
+        predicted_confidence = self.confidence_head(gated_features)
+
         outputs = {
             'direction_logits': direction_logits,
+            'signal_logits': signal_logits,
             'expected_return': expected_return,
             'expected_risk': expected_risk,
             'position_size': sizing_outputs['position_size'],
+            'predicted_confidence': predicted_confidence,
             'funding_sensitivity': sizing_outputs['funding_sensitivity']
         }
         
@@ -698,17 +721,17 @@ class DeribitHybridModel(nn.Module):
         with torch.no_grad():
             outputs = self.forward(x, funding_rate, asset_ids)
             
-            # Get direction probabilities
-            direction_probs = F.softmax(outputs['direction_logits'], dim=1)
+            # For inference, we use signal_logits (trading signals) rather than direction_logits (training signals)
+            signal_probs = F.softmax(outputs['signal_logits'], dim=1)
             
             # Get position size (scaled to [-1, 1])
             position_size = outputs['position_size']
             
             # Determine trading action
-            trade_action = torch.argmax(direction_probs, dim=1)  # 0=short, 1=flat, 2=long
+            trade_action = torch.argmax(signal_probs, dim=1)  # 0=short, 1=flat, 2=long
             
             # Apply confidence threshold
-            confidence = torch.max(direction_probs, dim=1)[0]
+            confidence = torch.max(signal_probs, dim=1)[0]
             valid_trades = confidence >= threshold
             
             # Create final position size incorporating direction and sizing
@@ -977,7 +1000,7 @@ class LightweightTransformer(nn.Module):
         super().__init__()
         
         # Simpler positional encoding
-        self.register_buffer('pe', self._build_positional_encoding(max_seq_length, d_model))
+        self.register_buffer('pe', self._build_positional_encoding(max_len=max_seq_length, d_model=d_model))
         self.dropout = nn.Dropout(dropout)
         
         # Encoder layers
@@ -1175,10 +1198,27 @@ class OptimizedDeribitModel(nn.Module):
             nn.Sigmoid()
         )
         
-        # Simplified prediction heads
-        # Direction head
+        # Direction classification head (3-way: long, flat, short)
         self.direction_head = nn.Sequential(
             nn.Linear(transformer_dim, 3)  # Direct classification for speed
+        )
+        
+        # Signal classification head for real trading signals
+        self.signal_head = nn.Sequential(
+            nn.Linear(transformer_dim, 64),
+            nn.LayerNorm(64),
+            nn.Mish(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 3)
+        )
+
+        # Signal confidence prediction
+        self.confidence_head = nn.Sequential(
+            nn.Linear(transformer_dim, 32),
+            nn.LayerNorm(32),
+            nn.Mish(),
+            nn.Linear(32, 1),
+            nn.ReLU()  # Confidence is always positive
         )
         
         # Return head
@@ -1249,12 +1289,17 @@ class OptimizedDeribitModel(nn.Module):
         # Get portfolio optimization metrics
         portfolio_outputs = self.portfolio_head(gated_features)
         
-        # Combine all outputs
+        # Add signals_logits and confidence predictions to the outputs
+        signal_logits = self.signal_head(gated_features)
+        predicted_confidence = self.confidence_head(gated_features)
+
         outputs = {
             'direction_logits': direction_logits,
+            'signal_logits': signal_logits,
             'expected_return': expected_return,
             'expected_risk': expected_risk,
             'position_size': sizing_outputs['position_size'],
+            'predicted_confidence': predicted_confidence,
             'funding_sensitivity': sizing_outputs['funding_sensitivity']
         }
         
@@ -1279,17 +1324,17 @@ class OptimizedDeribitModel(nn.Module):
         with torch.no_grad():
             outputs = self.forward(x, funding_rate, asset_ids)
             
-            # Get direction probabilities
-            direction_probs = F.softmax(outputs['direction_logits'], dim=1)
+            # For inference, we use signal_logits (trading signals) rather than direction_logits (training signals)
+            signal_probs = F.softmax(outputs['signal_logits'], dim=1)
             
             # Get position size (scaled to [-1, 1])
             position_size = outputs['position_size']
             
             # Determine trading action
-            trade_action = torch.argmax(direction_probs, dim=1)  # 0=short, 1=flat, 2=long
+            trade_action = torch.argmax(signal_probs, dim=1)  # 0=short, 1=flat, 2=long
             
             # Apply confidence threshold
-            confidence = torch.max(direction_probs, dim=1)[0]
+            confidence = torch.max(signal_probs, dim=1)[0]
             valid_trades = confidence >= threshold
             
             # Create final position size incorporating direction and sizing

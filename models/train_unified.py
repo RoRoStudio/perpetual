@@ -51,8 +51,8 @@ class FastDataset:
         
         self.feature_columns = None
         self.label_columns = [
-            "next_return_1bar", "next_return_2bar", "next_return_4bar", 
-            "direction_class", "next_volatility"
+            "future_return_1bar", "future_return_2bar", "future_return_4bar", 
+            "direction_class", "direction_signal", "future_volatility", "signal_confidence"
         ]
         
         # Add this line to create asset ID mapping
@@ -271,10 +271,12 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
             # NEW: Move asset_ids to device
             asset_ids = asset_ids.to(device, non_blocking=True)
             
-            # Extract individual targets
-            direction_class = targets[:, 3].long() + 1  # Convert -1,0,1 to 0,1,2
-            next_return = targets[:, 0].unsqueeze(1)
-            next_volatility = targets[:, 4].unsqueeze(1)
+            # Extract both direction_class and direction_signal for dual training
+            direction_class = targets[:, 3].long()  # Already 0,1,2 in database
+            direction_signal = targets[:, 4].long()  # Also 0,1,2 in database
+            future_return = targets[:, 0].unsqueeze(1)
+            future_volatility = targets[:, 5].unsqueeze(1)
+            signal_confidence = targets[:, 6].unsqueeze(1)
             
             # Mixed precision forward pass
             with autocast():
@@ -284,13 +286,15 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
                 # NEW: Use asset_ids instead of None
                 outputs = model(features, funding_rate, asset_ids)
                 
-                # Compute losses
-                direction_loss = direction_criterion(outputs['direction_logits'], direction_class)
-                return_loss = regression_criterion(outputs['expected_return'], next_return)
-                risk_loss = regression_criterion(outputs['expected_risk'], next_volatility)
-                
-                # Combined loss
-                loss = direction_loss + return_loss + 0.5 * risk_loss
+                # Compute losses with dual objectives
+                direction_class_loss = direction_criterion(outputs['direction_logits'], direction_class)
+                direction_signal_loss = direction_criterion(outputs['signal_logits'], direction_signal)
+                return_loss = regression_criterion(outputs['expected_return'], future_return)
+                risk_loss = regression_criterion(outputs['expected_risk'], future_volatility)
+                confidence_loss = regression_criterion(outputs['predicted_confidence'], signal_confidence)
+
+                # Combined loss with higher weight on direction_class (training target) but also learn direction_signal (trading target)
+                loss = direction_class_loss + 0.5 * direction_signal_loss + return_loss + 0.5 * risk_loss + 0.3 * confidence_loss
                 
                 # Scale loss for gradient accumulation
                 if gradient_accumulation > 1:
@@ -349,10 +353,12 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
                 # NEW: Move asset_ids to device
                 asset_ids = asset_ids.to(device, non_blocking=True)
                 
-                # Extract targets
-                direction_class = targets[:, 3].long() + 1  # Convert -1,0,1 to 0,1,2
-                next_return = targets[:, 0].unsqueeze(1)
-                next_volatility = targets[:, 4].unsqueeze(1)
+                # Extract both direction_class and direction_signal for dual evaluation
+                direction_class = targets[:, 3].long()  # Already 0,1,2 in database
+                direction_signal = targets[:, 4].long()  # Also 0,1,2 in database
+                future_return = targets[:, 0].unsqueeze(1)
+                future_volatility = targets[:, 5].unsqueeze(1)
+                signal_confidence = targets[:, 6].unsqueeze(1)
                 
                 # Create funding rate
                 funding_rate = torch.zeros(features.size(0), 1, device=device)
@@ -363,8 +369,8 @@ def train(model, train_loader, val_loader, optimizer, scheduler, scaler, device,
                     
                     # Compute losses
                     direction_loss = direction_criterion(outputs['direction_logits'], direction_class)
-                    return_loss = regression_criterion(outputs['expected_return'], next_return)
-                    risk_loss = regression_criterion(outputs['expected_risk'], next_volatility)
+                    return_loss = regression_criterion(outputs['expected_return'], future_return)
+                    risk_loss = regression_criterion(outputs['expected_risk'], future_volatility)
                     loss = direction_loss + return_loss + 0.5 * risk_loss
                 
                 # Record metrics
@@ -564,7 +570,7 @@ def main():
                     # Otherwise use the first instrument
                     instruments = [instruments[0]]
         except Exception as e:
-            logger.error(f"Error fetching instruments: {e}")
+            print(f"Error fetching instruments: {e}")
             raise  # Re-raise exception to halt execution
         finally:
             conn.close()
@@ -679,18 +685,18 @@ def main():
     
     # Initialize model
     input_dim = len(data.feature_columns)
-    
-    if max_speed:
-        model = OptimizedDeribitModel(
-            input_dim=input_dim,
-            **model_params
-        ).to(device)
-        print("⚡ Using OptimizedDeribitModel for maximum speed")
-    else:
-        model = DeribitHybridModel(
-            input_dim=input_dim,
-            **model_params
-        ).to(device)
+
+    # Auto-select model class based on max_speed flag
+    model_class = OptimizedDeribitModel if max_speed else DeribitHybridModel
+    model_name = model_class.__name__
+
+    model = model_class(
+        input_dim=input_dim,
+        **model_params
+    ).to(device)
+
+    print(f"🧠 Instantiated model: {model_name}")
+
     
     # Initialize optimizer and scheduler
     optimizer = optim.AdamW(
