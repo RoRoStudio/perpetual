@@ -39,6 +39,9 @@ from features.transformers import FeatureTransformer
 from models.architecture import DeribitHybridModel, OptimizedDeribitModel
 from models.profiler import TrainingProfiler
 
+# Define terms that indicate future-leaking features
+LEAKY_TERMS = ('future_', 'next_', 'direction_', 'signal_', 'quantile')
+
 # Set random seeds for reproducibility
 def set_seed(seed=42):
     random.seed(seed)
@@ -48,6 +51,28 @@ def set_seed(seed=42):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = False  # Better performance but less reproducible
         torch.backends.cudnn.benchmark = True  # Optimize convolution for fixed input sizes
+
+def validate_timestamps(df, debug_mode=False):
+    """
+    Validate timestamps are strictly increasing (dev/debug only).
+    
+    Args:
+        df: DataFrame with timestamp column
+        debug_mode: Whether to perform the check (slower)
+        
+    Returns:
+        True if valid, raises ValueError otherwise
+    """
+    if not debug_mode:
+        return True
+        
+    timestamps = df['timestamp'].values.astype('datetime64[ns]')
+    if len(timestamps) < 2:
+        return True
+        
+    if (np.diff(timestamps) <= np.timedelta64(0, 'ns')).any():
+        raise ValueError("Timestamps not strictly increasing")
+    return True
 
 class FastDataset:
     """Simplified dataset with optimized loading from Parquet"""
@@ -78,72 +103,78 @@ class FastDataset:
         all_train_asset_ids = []
         all_test_asset_ids = []
         
+        asset_map = {inst: idx for idx, inst in enumerate(self.instruments)}
+        
         for instrument in self.instruments:
-            # Try to load from Parquet (faster)
-            parquet_path = f"/mnt/p/perpetual/cache/tier1_{instrument}.parquet"
-            if not os.path.exists(parquet_path):
-                logger.warning(f"⚠️ Warning: Parquet file not found for {instrument}. Run 'python -m features.export_parquet' first.")
-                continue
-                
-            logger.info(f"Loading data from Parquet for {instrument}")
-            # Load using PyArrow with memory mapping for efficiency
-            table = pq.read_table(parquet_path, memory_map=True)
-            df = table.to_pandas()
+            # Try to load from separate Parquet files first (new structure)
+            features_path = f"/mnt/p/perpetual/cache/tier1_features_{instrument}.parquet"
+            labels_path = f"/mnt/p/perpetual/cache/tier1_labels_{instrument}.parquet"
             
-            # Validate expected columns are present
-            missing_labels = [col for col in self.label_columns if col not in df.columns]
-            if missing_labels:
-                logger.warning(f"⚠️ Missing label columns for {instrument}: {missing_labels}")
-                if "direction_class" in missing_labels:
-                    # Critical column is missing - skip this instrument
-                    logger.warning(f"⚠️ Skipping {instrument} due to missing direction_class column")
+            # Check if separate files exist
+            if os.path.exists(features_path) and os.path.exists(labels_path):
+                logger.info(f"Loading data from separate Parquet files for {instrument}")
+                
+                # Load features and labels
+                features_table = pq.read_table(features_path, memory_map=True)
+                features_df = features_table.to_pandas()
+                
+                labels_table = pq.read_table(labels_path, memory_map=True)
+                labels_df = labels_table.to_pandas()
+                
+                # Verify timestamps match
+                common_timestamps = set(features_df['timestamp']).intersection(set(labels_df['timestamp']))
+                if len(common_timestamps) < min(len(features_df), len(labels_df)) * 0.9:
+                    logger.warning(f"⚠️ Significant timestamp mismatch between features and labels for {instrument}")
                     continue
-                
-            # For backward compatibility, ensure these columns exist
-            if 'future_return_1bar' not in df.columns:
-                logger.warning(f"Warning: 'future_return_1bar' not found in data, using fallback")
-                df['future_return_1bar'] = df['return_1bar'].shift(-1)
-                df['future_return_2bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2)
-                df['future_return_4bar'] = df['return_1bar'].shift(-1) + df['return_1bar'].shift(-2) + \
-                                      df['return_1bar'].shift(-3) + df['return_1bar'].shift(-4)
-                df['future_volatility'] = df['return_1bar'].rolling(4).std().shift(-4)
-                df['signal_confidence'] = 1.0  # Default confidence
-            
-            # Fill NaNs
-            for col in self.label_columns:
-                if col in df.columns:
-                    df.loc[df.index[-4:], col] = 0
-            
-            # Store feature columns if not already set
-            if self.feature_columns is None:
-                # Select all columns except targets and metadata
-                exclude_cols = self.label_columns + ['instrument_name', 'timestamp']
-                self.feature_columns = [col for col in df.columns if col not in exclude_cols]
-            
-            # Apply transformation
-            transformer = FeatureTransformer(instrument)
-            
-            # Add validation for columns
-            missing_features = transformer.validate_feature_columns(df.columns)
-            if missing_features:
-                for col in missing_features:
-                    df[col] = 0.0  # Add missing columns with default values
                     
-            features_df = transformer.transform(df[self.feature_columns])
-            
-            # Validate target columns exist
-            available_targets = [col for col in self.label_columns if col in df.columns]
-            targets_df = df[available_targets]
-            
-            # Validate that direction_class is using 0,1,2 schema
-            if 'direction_class' in targets_df.columns:
-                unique_classes = targets_df['direction_class'].unique()
-                contains_negative = any(x < 0 for x in unique_classes if pd.notna(x))
-                if contains_negative:
-                    logger.warning(f"⚠️ Found old class schema (-1,0,1) in {instrument}. Converting to 0,1,2")
-                    # Convert -1 to 0, 0 to 1, 1 to 2
-                    targets_df['direction_class'] = targets_df['direction_class'] + 1
-            
+                # Filter both dataframes to only include common timestamps
+                features_df = features_df[features_df['timestamp'].isin(common_timestamps)]
+                labels_df = labels_df[labels_df['timestamp'].isin(common_timestamps)]
+                
+                # Sort by timestamp to ensure alignment
+                features_df = features_df.sort_values('timestamp')
+                labels_df = labels_df.sort_values('timestamp')
+                
+                # Validate timestamp order in debug mode
+                if os.environ.get('DEBUG', '0') == '1':
+                    validate_timestamps(features_df, debug_mode=True)
+                    
+                # Store feature columns if not already set
+                if self.feature_columns is None:
+                    # Filter out non-feature columns
+                    self.feature_columns = [col for col in features_df.columns 
+                                          if col not in ['instrument_name', 'timestamp']]
+                
+                # Apply transformation
+                transformer = FeatureTransformer(instrument)
+                
+                # Add validation for columns
+                missing_features = transformer.validate_feature_columns(features_df.columns)
+                if missing_features:
+                    for col in missing_features:
+                        features_df[col] = 0.0  # Add missing columns with default values
+                        
+                features_df = transformer.transform(features_df[self.feature_columns])
+                    
+                # Get targets from labels_df, ensuring consistent order with features
+                targets_df = pd.DataFrame()
+                for col in self.label_columns:
+                    if col in labels_df.columns:
+                        targets_df[col] = labels_df[col]
+                    else:
+                        logger.warning(f"Missing label column {col} for {instrument}, filling with 0")
+                        targets_df[col] = 0.0
+                        
+                # Safety check: ensure no leaky terms in feature columns
+                for col in list(self.feature_columns):  # Use list to allow modification during iteration
+                    if any(term in col for term in LEAKY_TERMS):
+                        logger.warning(f"⚠️ Found potential leaky feature: {col}. Removing from feature list.")
+                        self.feature_columns.remove(col)
+                        
+            else:
+                logger.error(f"No Parquet files found for {instrument}. Please run export_parquet.py with --separate-tables first.")
+                continue
+
             # Create sequences
             features, targets = self._create_sequences(features_df, targets_df)
             
@@ -161,7 +192,7 @@ class FastDataset:
             all_test_targets.append(test_targets)
             
             # Add these lines to create and store asset IDs
-            instrument_id = self.asset_ids.get(instrument, 0)
+            instrument_id = asset_map.get(instrument, 0)
             train_asset_ids = torch.full((len(train_features),), instrument_id, dtype=torch.long)
             test_asset_ids = torch.full((len(test_features),), instrument_id, dtype=torch.long)
             all_train_asset_ids.append(train_asset_ids)
@@ -847,6 +878,7 @@ def main():
         logger.error(traceback.format_exc())
         # Try to save a backup model if possible
         try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             emergency_path = f"{args.output_dir}/model_emergency_{timestamp}.pt"
             torch.save({
                 'model_state_dict': model.state_dict(),
@@ -858,7 +890,7 @@ def main():
         raise
 
     # Clean up temporary config file if we created one
-    if unknown and 'tempfile' in locals() and os.path.exists(args.sweep_config):
+    if unknown and 'args' in locals() and hasattr(args, 'sweep_config') and os.path.exists(args.sweep_config):
         try:
             os.unlink(args.sweep_config)
         except:

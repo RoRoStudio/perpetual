@@ -3,9 +3,9 @@
 compute_tier1.py
 -----------------------------------------------------
 Builds real-time-safe features for 15m bars for use
-in model_features_15m_tier1. This table powers both
-live inference and supervised training. All features
-are computed from past-only data — no leakage.
+in tier1_features_15m and tier1_labels_15m tables. 
+These tables power both live inference and supervised training. 
+All features are computed from past-only data — no leakage.
 -----------------------------------------------------
 """
 
@@ -23,6 +23,7 @@ from configparser import ConfigParser
 from concurrent.futures import ThreadPoolExecutor
 import os
 import traceback
+from typing import Tuple
 
 from data.database import get_connection, db_connection
 from features.utils import (
@@ -34,6 +35,9 @@ from features.utils import (
     safe_divide,
     rolling_percentile_rank,
 )
+
+# Define terms that indicate future-leaking features
+LEAKY_TERMS = ('future_', 'next_', 'direction_', 'signal_', 'quantile')
 
 # --- Config
 ROLLING_WINDOW_VOL = 4 * 4  # 1h window for 15m bars
@@ -59,23 +63,10 @@ def encode_calendar_fields(df: pd.DataFrame) -> pd.DataFrame:
     df['day_of_week_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
     df['is_weekend'] = df['day_of_week'].isin([5, 6])
     
-    # Fixed calculation for minutes to next funding time (00:00, 08:00, 16:00 UTC)
-    # Handle each timestamp individually to avoid negative values
-    funding_times = [0, 8, 16]  # Hours when funding occurs
-    
-    # Define a function to calculate minutes to next funding
-    def get_mins_to_next_funding(row):
-        hour = row['timestamp'].hour
-        minute = row['timestamp'].minute
-        
-        # Find the next funding hour
-        next_funding = next((h for h in funding_times if h > hour), funding_times[0] + 24)
-        
-        # Calculate minutes until next funding
-        return (next_funding - hour) * 60 - minute
-    
-    # Apply the function to each row
-    df['mins_to_next_funding'] = df.apply(get_mins_to_next_funding, axis=1).astype('int16')
+    # Vectorized calculation for mins_to_next_funding (funding at 00:00, 08:00, 16:00 UTC)
+    dt = df['timestamp'].dt
+    mins_since_funding = (dt.hour % 8) * 60 + dt.minute
+    df['mins_to_next_funding'] = ((8 * 60) - mins_since_funding).clip(0, 480).astype('int16')
     
     return df
 
@@ -402,20 +393,19 @@ def calculate_relative_ranks(instrument_name, timestamp, conn):
         return_rank = np.searchsorted(np.sort(return_values), all_returns[instrument_name]) / len(return_values)
         
         # Calculate funding rank
+        funding_rank = None
         if all_funding and instrument_name in all_funding:
             funding_values = list(all_funding.values())
             if len(funding_values) >= 3:
                 funding_rank = np.searchsorted(np.sort(funding_values), all_funding[instrument_name]) / len(funding_values)
-            else:
-                funding_rank = None
             
         return return_rank, funding_rank
     except Exception as e:
         logger.error(f"Error calculating ranks: {e}")
         return None, None
 
-# --- NEW: Calculate future returns and dual labels with adaptive thresholds
-def calculate_future_returns_and_labels(df: pd.DataFrame, instrument_name: str) -> pd.DataFrame:
+# --- Calculate future returns and dual labels with adaptive thresholds
+def calculate_future_returns_and_labels(df: pd.DataFrame, instrument_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Advanced dual labeling strategy with adaptive thresholds:
     1. direction_class: Perfect balance using global percentiles (for training) - Using 0,1,2
@@ -517,7 +507,19 @@ def calculate_future_returns_and_labels(df: pd.DataFrame, instrument_name: str) 
     df['return_quantile_rank'] = (valid_returns.rank(pct=True).reindex(df.index)
                                  .fillna(0.5))  # Default to middle rank if no data
     
-    return df
+    # Create separate feature and label DataFrames
+    feature_cols = [col for col in df.columns 
+                   if not any(term in col for term in LEAKY_TERMS)
+                   and col not in ('timestamp', 'instrument_name')]
+    
+    label_cols = ['future_return_1bar', 'future_return_2bar', 'future_return_4bar',
+                 'future_volatility', 'direction_class', 'direction_signal', 
+                 'signal_confidence', 'return_quantile_rank']
+    
+    features_df = df[['instrument_name', 'timestamp'] + feature_cols].copy()
+    labels_df = df[['instrument_name', 'timestamp'] + label_cols].copy()
+    
+    return features_df, labels_df
 
 # --- Compute features for a single instrument
 def compute_features_for_instrument(conn, instrument_name: str):
@@ -528,13 +530,13 @@ def compute_features_for_instrument(conn, instrument_name: str):
         # Load data with possible limit for rolling updates
         limit = ROLLING_WINDOW if COMPUTE_MODE == 'rolling_update' else None
         ohlcv = load_ohlcv_data(conn, instrument_name, limit)
-        funding = load_funding_data(conn, instrument_name, limit)
         
         # Check if we have any data at all
         if len(ohlcv) == 0:
             logger.warning(f"⚠️ No OHLCV data found for {instrument_name}")
             return
             
+        funding = load_funding_data(conn, instrument_name, limit)
         if len(funding) == 0:
             logger.warning(f"⚠️ No funding data found for {instrument_name}, proceeding with empty funding features")
             
@@ -709,58 +711,43 @@ def compute_features_for_instrument(conn, instrument_name: str):
         # Add instrument name
         df['instrument_name'] = instrument_name
         
-        # Calculate future returns and advanced labels
+        # Calculate future returns and advanced labels - now returns features and labels separately
         try:
-            df = calculate_future_returns_and_labels(df, instrument_name)
+            features_df, labels_df = calculate_future_returns_and_labels(df, instrument_name)
         except Exception as e:
             logger.error(f"❌ Error calculating labels for {instrument_name}: {e}")
             logger.error(traceback.format_exc())
             return
         
-        # Keep only allowed columns and drop any remaining NaN rows
-        keep_cols = [
-            "instrument_name", "timestamp",
-            "return_1bar", "return_2bar", "return_4bar", "return_acceleration",
-            "price_range_ratio", "candle_body_ratio", "wick_upper_ratio", "wick_lower_ratio",
-            "volume", "volume_change_pct", "volume_zscore", "volume_ratio",
-            "volatility_1h", "volatility_trend", "atr_normalized",
-            "funding_1h", "funding_8h", "funding_spread", "funding_direction",
-            "cumulative_funding_4h", "funding_rate_zscore", "basis", "basis_change",
-            "btc_vol_index", "btc_vol_change_1h", "btc_vol_change_4h", "btc_vol_zscore",
-            "eth_vol_index", "eth_vol_change_1h", "eth_vol_change_4h", "eth_vol_zscore",
-            "btc_return_1bar", "eth_return_1bar", 
-            "correlation_with_btc", "correlation_with_eth",
-            "relative_return_rank", "relative_funding_rank",
-            "hour_of_day_sin", "hour_of_day_cos", "day_of_week_sin", "day_of_week_cos",
-            "is_weekend", "mins_to_next_funding",
-            # Future returns and advanced dual labels
-            "future_return_1bar", "future_return_2bar", "future_return_4bar",
-            "future_volatility", "direction_class", "direction_signal", "return_quantile_rank",
-            "volatility_20bar", "signal_confidence"
-        ]
-        
-        # Ensure we only keep columns that are in the keep_cols list
-        final_cols = [col for col in keep_cols if col in df.columns]
-        df = df[final_cols].copy()
-        
-        # Fill any remaining NaN values with zeros to avoid insertion errors
-        df = df.fillna(0)
+        # Fill NaNs in both dataframes
+        features_df = features_df.fillna(0)
+        labels_df = labels_df.fillna(0)
         
         if COMPUTE_MODE == 'rolling_update':
             # For rolling update, only keep the most recent rows that don't exist in the DB
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT MAX(timestamp) FROM model_features_15m_tier1
+                    SELECT MAX(timestamp) FROM tier1_features_15m
                     WHERE instrument_name = %s
                 """, (instrument_name,))
                 last_ts = cur.fetchone()[0]
             
             if last_ts:
-                df = df[df['timestamp'] > last_ts].copy()
+                features_df = features_df[features_df['timestamp'] > last_ts].copy()
+                labels_df = labels_df[labels_df['timestamp'] > last_ts].copy()
         
         # Only insert if we have data
-        if len(df) > 0:
-            write_features_to_db(conn, df)
+        if len(features_df) > 0:
+            # First insert features, then labels
+            try:
+                success = write_features_to_db(conn, features_df)
+                if success and len(labels_df) > 0:
+                    write_labels_to_db(conn, labels_df)
+            except Exception as e:
+                logger.error(f"❌ Error inserting data for {instrument_name}: {e}")
+                logger.error(traceback.format_exc())
+                conn.rollback()
+                
         else:
             logger.info(f"No new data to insert for {instrument_name}")
             
@@ -774,114 +761,202 @@ def compute_features_for_instrument(conn, instrument_name: str):
         except:
             pass
 
-# --- Write to DB
-def write_features_to_db(conn, df: pd.DataFrame):
-    """Write features to the database using COPY for maximum performance"""
+# --- Write features to DB
+def write_features_to_db(conn, df: pd.DataFrame) -> bool:
+    """
+    Write features to the database using execute_batch method.
+    
+    Args:
+        conn: Database connection
+        df: DataFrame with feature data
+        
+    Returns:
+        True if successful, False otherwise
+    """
     if len(df) == 0:
         logger.warning("No data to insert")
-        return
+        return False
         
     try:
         # For full backfill mode, consider deleting and reinserting
         if COMPUTE_MODE == 'full_backfill':
+            # Get all columns in the target table
             with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'tier1_features_15m'
+                    ORDER BY ordinal_position
+                """)
+                table_columns = [row[0] for row in cur.fetchall()]
+                
                 # Delete existing data for this instrument
                 cur.execute("""
-                    DELETE FROM model_features_15m_tier1 
+                    DELETE FROM tier1_features_15m 
                     WHERE instrument_name = %s
                 """, (df['instrument_name'].iloc[0],))
                 
-                # Create a temporary table
-                cur.execute("CREATE TEMP TABLE tmp_features (LIKE model_features_15m_tier1 INCLUDING ALL) ON COMMIT DROP")
+                # Only keep columns that exist in the table
+                df_columns = [col for col in df.columns if col in table_columns]
                 
-                # Convert DataFrame to CSV-like buffer
-                from io import StringIO
-                buffer = StringIO()
-                df.to_csv(buffer, index=False, header=False, sep='\t')
-                buffer.seek(0)
+                # Execute insert
+                placeholders = ', '.join(['%s'] * len(df_columns))
+                insert_query = f"""
+                    INSERT INTO tier1_features_15m ({', '.join(df_columns)})
+                    VALUES ({placeholders})
+                """
                 
-                # Use COPY command for bulk insert
-                columns = df.columns.tolist()
-                cur.copy_from(buffer, 'tmp_features', columns=columns)
+                # Convert dataframe to list of tuples
+                values = [tuple(row) for row in df[df_columns].values]
                 
-                # Insert from temp table to main table
-                cur.execute("""
-                    INSERT INTO model_features_15m_tier1
-                    SELECT * FROM tmp_features
-                """)
-            
-            conn.commit()
-            logger.info(f"✅ Successfully inserted {len(df)} rows using COPY method")
+                # Use execute_batch instead of copy_from
+                psycopg2.extras.execute_batch(cur, insert_query, values, page_size=1000)
+                conn.commit()
+                
+                logger.info(f"✅ Successfully inserted {len(df)} rows to tier1_features_15m")
+                return True
+                
         else:
-            # For rolling updates, stick with execute_batch but increase page size
-            columns = df.columns.tolist()
-            placeholders = ["%s"] * len(columns)
-            
-            insert_query = f"""
-                INSERT INTO model_features_15m_tier1 ({', '.join(columns)})
-                VALUES ({', '.join(placeholders)})
-                ON CONFLICT (instrument_name, timestamp) DO UPDATE SET
-            """
-            
-            update_cols = [col for col in columns if col not in ['instrument_name', 'timestamp']]
-            update_clause = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_cols])
-            insert_query += update_clause
-            
+            # For rolling updates
+            # Get all columns in the target table
             with conn.cursor() as cur:
-                values = [tuple(x) for x in df.to_numpy()]
-                # Increase page size to 5000 for better performance
-                psycopg2.extras.execute_batch(cur, insert_query, values, page_size=5000)
-            
-            conn.commit()
-            logger.info(f"✅ Successfully upserted {len(df)} rows")
+                cur.execute("""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'tier1_features_15m'
+                    ORDER BY ordinal_position
+                """)
+                table_columns = [row[0] for row in cur.fetchall()]
+                
+                # Only keep columns that exist in the table
+                df_columns = [col for col in df.columns if col in table_columns]
+                
+                # Prepare statements
+                placeholders = ', '.join(['%s'] * len(df_columns))
+                insert_query = f"""
+                    INSERT INTO tier1_features_15m ({', '.join(df_columns)})
+                    VALUES ({placeholders})
+                    ON CONFLICT (instrument_name, timestamp) DO UPDATE SET
+                """
+                
+                update_cols = [col for col in df_columns if col not in ['instrument_name', 'timestamp']]
+                update_clause = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_cols])
+                insert_query += update_clause
+                
+                # Convert dataframe to list of tuples
+                values = [tuple(row) for row in df[df_columns].values]
+                
+                # Use execute_batch instead of copy_from
+                psycopg2.extras.execute_batch(cur, insert_query, values, page_size=1000)
+                conn.commit()
+                
+                logger.info(f"✅ Successfully upserted {len(df)} rows to tier1_features_15m")
+                return True
+                
     except Exception as e:
         conn.rollback()
-        logger.error(f"❌ Error inserting data: {e}")
+        logger.error(f"❌ Error inserting data to tier1_features_15m: {e}")
         logger.error(traceback.format_exc())
+        return False
 
-# --- Manage database indexes
-def manage_indexes(conn, disable=True):
+# --- Write labels to DB
+def write_labels_to_db(conn, df: pd.DataFrame) -> bool:
     """
-    Enable or disable indexes on the model_features_15m_tier1 table.
+    Write labels to the database using execute_batch method.
     
     Args:
         conn: Database connection
-        disable: True to disable indexes, False to recreate them
-    
-    Returns:
-        True if operation succeeded, False otherwise
-    """
-    try:
-        with conn.cursor() as cur:
-            # Set autovacuum based on disable parameter
-            cur.execute(f"ALTER TABLE model_features_15m_tier1 SET (autovacuum_enabled = {not disable})")
-            
-            # Get all indexes except primary key
-            cur.execute("""
-                SELECT indexname FROM pg_indexes 
-                WHERE tablename = 'model_features_15m_tier1' 
-                AND indexname NOT LIKE '%pkey%'
-            """)
-            indexes = [row[0] for row in cur.fetchall()]
-            
-            if disable:
-                # Drop indexes
-                for idx in indexes:
-                    logger.info(f"Dropping index: {idx}")
-                    cur.execute(f"DROP INDEX IF EXISTS {idx}")
-            else:
-                # Recreate indexes
-                logger.info("Recreating indexes...")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_model_features_timestamp ON model_features_15m_tier1 (timestamp)")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_model_features_instrument_timestamp ON model_features_15m_tier1 (instrument_name, timestamp)")
-                
-                # Analyze table
-                cur.execute("ANALYZE model_features_15m_tier1")
+        df: DataFrame with label data
         
-        conn.commit()
-        return True
+    Returns:
+        True if successful, False otherwise
+    """
+    if len(df) == 0:
+        logger.warning("No label data to insert")
+        return False
+    
+    try:
+        # For full backfill mode, consider deleting and reinserting
+        if COMPUTE_MODE == 'full_backfill':
+            # Get all columns in the target table
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'tier1_labels_15m'
+                    ORDER BY ordinal_position
+                """)
+                table_columns = [row[0] for row in cur.fetchall()]
+                
+                # Delete existing data for this instrument
+                cur.execute("""
+                    DELETE FROM tier1_labels_15m 
+                    WHERE instrument_name = %s
+                """, (df['instrument_name'].iloc[0],))
+                
+                # Only keep columns that exist in the table
+                df_columns = [col for col in df.columns if col in table_columns]
+                
+                # Execute insert for each row to handle foreign key dependencies
+                placeholders = ', '.join(['%s'] * len(df_columns))
+                insert_query = f"""
+                    INSERT INTO tier1_labels_15m ({', '.join(df_columns)})
+                    VALUES ({placeholders})
+                """
+                
+                # Convert dataframe to list of tuples
+                values = [tuple(row) for row in df[df_columns].values]
+                
+                # Add ON CONFLICT clause for insert safety
+                safe_insert_query = f"""
+                    INSERT INTO tier1_labels_15m ({', '.join(df_columns)})
+                    VALUES ({placeholders})
+                    ON CONFLICT DO NOTHING
+                """
+                
+                # Use execute_batch with smaller batches
+                psycopg2.extras.execute_batch(cur, safe_insert_query, values, page_size=500)
+                conn.commit()
+                
+                logger.info(f"✅ Successfully inserted {len(df)} rows to tier1_labels_15m")
+                return True
+                
+        else:
+            # For rolling updates
+            # Get all columns in the target table
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'tier1_labels_15m'
+                    ORDER BY ordinal_position
+                """)
+                table_columns = [row[0] for row in cur.fetchall()]
+                
+                # Only keep columns that exist in the table
+                df_columns = [col for col in df.columns if col in table_columns]
+                
+                # Prepare statements
+                placeholders = ', '.join(['%s'] * len(df_columns))
+                insert_query = f"""
+                    INSERT INTO tier1_labels_15m ({', '.join(df_columns)})
+                    VALUES ({placeholders})
+                    ON CONFLICT (instrument_name, timestamp) DO UPDATE SET
+                """
+                
+                update_cols = [col for col in df_columns if col not in ['instrument_name', 'timestamp']]
+                update_clause = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_cols])
+                insert_query += update_clause
+                
+                # Convert dataframe to list of tuples
+                values = [tuple(row) for row in df[df_columns].values]
+                
+                # Use execute_batch with smaller batches
+                psycopg2.extras.execute_batch(cur, insert_query, values, page_size=500)
+                conn.commit()
+                
+                logger.info(f"✅ Successfully upserted {len(df)} rows to tier1_labels_15m")
+                return True
+                
     except Exception as e:
-        logger.error(f"Failed to {'disable' if disable else 'recreate'} indexes: {e}")
+        conn.rollback()
+        logger.error(f"❌ Error inserting data to tier1_labels_15m: {e}")
         logger.error(traceback.format_exc())
         return False
 
@@ -905,24 +980,35 @@ def main():
     # For multiple instruments, use parallel processing
     with db_connection() as conn:
         try:
-            # Get list of instruments
+            # Get list of instruments - use only instruments with the USDC quote currency
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT instrument_name FROM instruments 
-                    WHERE used = TRUE ORDER BY instrument_name
+                    WHERE used = TRUE AND quote_currency = 'USDC'
+                    ORDER BY instrument_name
                 """)
                 instruments = [row[0] for row in cur.fetchall()]
+                
+            if not instruments:
+                logger.error("No active USDC-quoted instruments found in the database!")
+                return
             
             logger.info(f"Found {len(instruments)} instruments to process")
             logger.info(f"Running in {COMPUTE_MODE} mode with window size {ROLLING_WINDOW}")
             logger.info(f"Using {args.threads} parallel threads")
             
-            # Temporarily disable indexes for full backfill mode
-            indexes_disabled = False
+            # Temporarily disable autovacuum for full backfill mode
+            # Note: We don't create or drop indexes, just change autovacuum setting
             if COMPUTE_MODE == 'full_backfill':
-                indexes_disabled = manage_indexes(conn, disable=True)
-                if indexes_disabled:
-                    logger.info("Indexes disabled, proceeding with bulk loading")
+                try:
+                    with conn.cursor() as cur:
+                        for table in ['tier1_features_15m', 'tier1_labels_15m']:
+                            cur.execute(f"ALTER TABLE {table} SET (autovacuum_enabled = false)")
+                    conn.commit()
+                    logger.info("Autovacuum disabled, proceeding with bulk loading")
+                except Exception as e:
+                    logger.error(f"Error disabling autovacuum: {e}")
+                    logger.error(traceback.format_exc())
             
             # Each thread needs its own DB connection, so we create a function that opens one
             def process_instrument(symbol):
@@ -946,13 +1032,18 @@ def main():
                     
             logger.info(f"✅ All instruments processed using {args.threads} threads")
             
-            # After all processing is complete, recreate indexes if we disabled them
-            if indexes_disabled:
-                logger.info("Recreating indexes...")
-                if manage_indexes(conn, disable=False):
-                    logger.info("Indexes recreated and autovacuum re-enabled")
-                else:
-                    logger.error("Failed to recreate indexes")
+            # Re-enable autovacuum if we disabled it
+            if COMPUTE_MODE == 'full_backfill':
+                try:
+                    with conn.cursor() as cur:
+                        for table in ['tier1_features_15m', 'tier1_labels_15m']:
+                            cur.execute(f"ALTER TABLE {table} SET (autovacuum_enabled = true)")
+                            cur.execute(f"ANALYZE {table}")
+                    conn.commit()
+                    logger.info("Autovacuum re-enabled")
+                except Exception as e:
+                    logger.error(f"Error re-enabling autovacuum: {e}")
+                    logger.error(traceback.format_exc())
                 
         except Exception as e:
             logger.exception(f"❌ Error in main process: {e}")

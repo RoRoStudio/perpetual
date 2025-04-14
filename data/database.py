@@ -15,7 +15,7 @@ logger = logging.getLogger("database")
 # Create a global connection pool
 _connection_pool = None
 
-def initialize_connection_pool(min_connections=1, max_connections=10):
+def initialize_connection_pool(min_connections=2, max_connections=30):
     """
     Initialize the global connection pool.
     Should be called at application startup.

@@ -2,7 +2,7 @@
 """
 export_parquet.py
 -----------------------------------------------------
-Exports tier1 features from PostgreSQL to Parquet format
+Exports tier1 features and labels from PostgreSQL to Parquet format
 for faster data loading during model training. This
 optimization provides 3-4x speedup for data loading.
 -----------------------------------------------------
@@ -26,15 +26,17 @@ sys.path.append('/mnt/p/perpetual')
 
 from data.database import get_connection, db_connection
 
+# Define terms that indicate future-leaking features
+LEAKY_TERMS = ('future_', 'next_', 'direction_', 'signal_', 'quantile')
+
 # Configure logging
 logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("export_parquet")
 
-def export_parquet(instrument, output_dir, overwrite=False):
+def export_separate_tables(instrument, output_dir, overwrite=False):
     """
-    Export tier1 features for a specific instrument to Parquet format.
-    Also validates and fixes direction class schema if needed.
+    Export tier1 features and labels for a specific instrument to separate Parquet files.
     
     Args:
         instrument: Name of the instrument
@@ -42,125 +44,85 @@ def export_parquet(instrument, output_dir, overwrite=False):
         overwrite: Whether to overwrite existing files
     
     Returns:
-        Path to the exported Parquet file or None if failed
+        Tuple of (features_path, labels_path) or (None, None) if failed
     """
-    output_path = os.path.join(output_dir, f"tier1_{instrument}.parquet")
+    features_path = os.path.join(output_dir, f"tier1_features_{instrument}.parquet")
+    labels_path = os.path.join(output_dir, f"tier1_labels_{instrument}.parquet")
     
-    # Check if file already exists and skip if not overwriting
-    if os.path.exists(output_path) and not overwrite:
-        logger.info(f"Skipping {instrument} - file already exists")
-        return output_path
+    # Check if files already exist and skip if not overwriting
+    if os.path.exists(features_path) and os.path.exists(labels_path) and not overwrite:
+        logger.info(f"Skipping {instrument} - files already exist")
+        return features_path, labels_path
     
     try:
-        logger.info(f"Exporting data for {instrument}")
+        logger.info(f"Exporting feature and label data for {instrument}")
         with db_connection() as conn:
-            # Get data from PostgreSQL
-            df = pd.read_sql(
-                "SELECT * FROM model_features_15m_tier1 WHERE instrument_name = %s ORDER BY timestamp",
-                conn,
-                params=(instrument,)
+            # Get feature data from PostgreSQL
+            features_df = pd.read_sql(
+                "SELECT * FROM tier1_features_15m WHERE instrument_name = %s ORDER BY timestamp",
+                conn, params=(instrument,)
+            )
+            
+            # Get label data
+            labels_df = pd.read_sql(
+                "SELECT * FROM tier1_labels_15m WHERE instrument_name = %s ORDER BY timestamp",
+                conn, params=(instrument,)
             )
             
             # Check if we got any data
-            if len(df) == 0:
-                logger.warning(f"No data found for {instrument}")
-                return None
+            if len(features_df) == 0 or len(labels_df) == 0:
+                logger.warning(f"No data found for {instrument} in separate tables")
+                return None, None
                 
-            logger.info(f"Retrieved {len(df)} rows for {instrument}")
-            
-            # Validate and fix direction class schema
-            if 'direction_class' in df.columns:
-                unique_classes = df['direction_class'].unique()
-                contains_negative = any(x < 0 for x in unique_classes if pd.notna(x))
-                
-                if contains_negative:
-                    logger.info(f"Fixing direction_class schema for {instrument} (-1,0,1 -> 0,1,2)")
-                    df['direction_class'] = df['direction_class'] + 1
-                    
-            if 'direction_signal' in df.columns:
-                unique_signals = df['direction_signal'].unique()
-                contains_negative = any(x < 0 for x in unique_signals if pd.notna(x))
-                
-                if contains_negative:
-                    logger.info(f"Fixing direction_signal schema for {instrument} (-1,0,1 -> 0,1,2)")
-                    df['direction_signal'] = df['direction_signal'] + 1
+            logger.info(f"Retrieved {len(features_df)} rows for {instrument}")
             
             # Convert to PyArrow table and write to Parquet
-            table = pa.Table.from_pandas(df)
-            pq.write_table(table, output_path, compression="ZSTD")
+            features_table = pa.Table.from_pandas(features_df)
+            labels_table = pa.Table.from_pandas(labels_df)
             
-            logger.info(f"Exported {instrument} to {output_path}")
-            return output_path
+            pq.write_table(features_table, features_path, compression="ZSTD")
+            pq.write_table(labels_table, labels_path, compression="ZSTD")
+            
+            logger.info(f"Exported {instrument} to {features_path} and {labels_path}")
+            return features_path, labels_path
             
     except Exception as e:
         logger.error(f"Error exporting {instrument}: {e}")
         logger.error(traceback.format_exc())
-        return None
+        return None, None
 
-def export_all_instruments(output_dir, overwrite=False, max_workers=4):
+def get_feature_whitelist(conn, instrument_name):
     """
-    Export tier1 features for all active instruments.
+    Get only safe feature columns from tier1_features_15m.
     
     Args:
-        output_dir: Directory to save Parquet files
-        overwrite: Whether to overwrite existing files
-        max_workers: Maximum number of parallel workers
-    
+        conn: Database connection
+        instrument_name: Name of the instrument
+        
     Returns:
-        List of paths to exported Parquet files
+        List of column names that are safe to use as features
     """
-    try:
-        # Get list of instruments marked as 'used' in the database
-        with db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT i.instrument_name
-                    FROM instruments i
-                    WHERE i.used = TRUE
-                    ORDER BY i.instrument_name
-                """)
-                instruments = [row[0] for row in cur.fetchall()]
-            
-            # No fallback - require database to return instruments
-            if not instruments:
-                raise ValueError("No instruments found with used=TRUE in database. Check instruments table.")
-        
-        logger.info(f"Found {len(instruments)} instruments")
-        
-        # Export each instrument in parallel
-        exported_paths = []
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Create a dictionary of futures to instrument names
-            future_to_instrument = {
-                executor.submit(export_parquet, instrument, output_dir, overwrite): instrument
-                for instrument in instruments
-            }
-            
-            # Process completed exports as they finish
-            for future in tqdm(concurrent.futures.as_completed(future_to_instrument), 
-                               total=len(instruments), 
-                               desc="Exporting instruments"):
-                instrument = future_to_instrument[future]
-                try:
-                    path = future.result()
-                    if path:
-                        exported_paths.append(path)
-                except Exception as e:
-                    logger.error(f"Error exporting {instrument}: {e}")
-                    logger.error(traceback.format_exc())
-                
-        logger.info(f"Successfully exported {len(exported_paths)} out of {len(instruments)} instruments")
-        return exported_paths
-        
-    except Exception as e:
-        logger.error(f"Error exporting all instruments: {e}")
-        logger.error(traceback.format_exc())
-        return []
+    # Query tier1_features_15m to get column names
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'tier1_features_15m'
+        """)
+        all_columns = [row[0] for row in cur.fetchall()]
+    
+    # Apply whitelist filter
+    feature_columns = [
+        col for col in all_columns
+        if not any(term in col for term in LEAKY_TERMS)
+        and col not in ('instrument_name', 'timestamp')
+    ]
+    
+    return feature_columns
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Export tier1 features from PostgreSQL to Parquet format")
+    parser = argparse.ArgumentParser(description="Export tier1 features and labels from PostgreSQL to Parquet format")
     parser.add_argument("--instrument", type=str, help="Export data for a specific instrument")
     parser.add_argument("--output-dir", type=str, default="/mnt/p/perpetual/cache", 
                       help="Directory to save Parquet files")
@@ -175,10 +137,40 @@ def main():
     
     if args.instrument:
         # Export a single instrument
-        export_parquet(args.instrument, args.output_dir, args.overwrite)
+        export_separate_tables(args.instrument, args.output_dir, args.overwrite)
     else:
-        # Export all instruments
-        export_all_instruments(args.output_dir, args.overwrite, args.parallel)
+        # Export all instruments in parallel
+        with db_connection() as conn:
+            # Get instrument list
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT instrument_name 
+                    FROM tier1_features_15m 
+                    ORDER BY instrument_name
+                """)
+                instruments = [row[0] for row in cur.fetchall()]
+                
+        # Export each instrument
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as executor:
+            futures = {
+                executor.submit(export_separate_tables, instrument, args.output_dir, args.overwrite): instrument
+                for instrument in instruments
+            }
+            
+            for future in tqdm(concurrent.futures.as_completed(futures), 
+                            total=len(instruments), 
+                            desc="Exporting instruments"):
+                instrument = futures[future]
+                try:
+                    feature_path, label_path = future.result()
+                    if feature_path and label_path:
+                        results.append((feature_path, label_path))
+                except Exception as e:
+                    logger.error(f"Error exporting {instrument}: {e}")
+                    logger.error(traceback.format_exc())
+                    
+        logger.info(f"Successfully exported {len(results)} out of {len(instruments)} instruments")
     
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()

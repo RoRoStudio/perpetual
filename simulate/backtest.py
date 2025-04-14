@@ -1,175 +1,3 @@
-# simulate/backtest.py
-import argparse
-import os
-import json
-import torch
-import wandb
-import numpy as np
-from tqdm import tqdm
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.metrics import classification_report, confusion_matrix
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pyarrow.parquet as pq
-
-from models.architecture import DeribitHybridModel, OptimizedDeribitModel
-from features.transformers import FeatureTransformer
-
-def load_sidecar_config(checkpoint_path):
-    json_path = checkpoint_path.replace(".pt", ".json")
-    if not os.path.exists(json_path):
-        raise FileNotFoundError(f"Missing sidecar config: {json_path}")
-    with open(json_path, "r") as f:
-        return json.load(f)
-
-def load_dataset(instruments, seq_length, feature_columns):
-    all_features = []
-    all_targets = []
-    all_asset_ids = []
-    asset_map = {inst: idx for idx, inst in enumerate(instruments)}
-    label_cols = ["direction_class"]
-
-    for instrument in instruments:
-        path = f"/mnt/p/perpetual/cache/tier1_{instrument}.parquet"
-        table = pq.read_table(path, memory_map=True)
-        df = table.to_pandas()
-
-        if "direction_class" not in df.columns:
-            raise ValueError(f"Missing direction_class in {instrument} data")
-
-        for col in label_cols:
-            df[col].fillna(0, inplace=True)
-
-        transformer = FeatureTransformer(instrument)
-        features_df = transformer.transform(df[feature_columns])
-        targets_df = df[label_cols]
-
-        features_np = features_df.values.astype(np.float32)
-        targets_np = targets_df.values.astype(np.float32)
-
-        num_seqs = len(features_np) - seq_length + 1
-        feat_seq = torch.zeros((num_seqs, seq_length, features_np.shape[1]))
-        targ_seq = torch.zeros((num_seqs,), dtype=torch.long)
-        ids_seq = torch.full((num_seqs,), asset_map[instrument], dtype=torch.long)
-
-        for i in range(num_seqs):
-            feat_seq[i] = torch.tensor(features_np[i:i + seq_length])
-            targ_seq[i] = int(targets_np[i + seq_length - 1][0] + 1)  # shift to [0,1,2]
-
-        all_features.append(feat_seq)
-        all_targets.append(targ_seq)
-        all_asset_ids.append(ids_seq)
-
-    return (
-        torch.cat(all_features),
-        torch.cat(all_targets),
-        torch.cat(all_asset_ids)
-    )
-
-def log_confusion_matrix(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2])
-    fig, ax = plt.subplots(figsize=(5, 4))
-    sns.heatmap(cm, annot=True, fmt='d',
-                xticklabels=["DOWN", "NEUTRAL", "UP"],
-                yticklabels=["DOWN", "NEUTRAL", "UP"],
-                cmap="Blues", ax=ax)
-    ax.set_title("Confusion Matrix")
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("Actual")
-    wandb.log({"confusion_matrix": wandb.Image(fig)})
-    plt.close(fig)
-
-def log_prediction_distribution(y_true, y_pred):
-    fig, ax = plt.subplots()
-    bins = np.arange(4) - 0.5
-    ax.hist(y_true, bins=bins, alpha=0.5, label="Actual", edgecolor='black')
-    ax.hist(y_pred, bins=bins, alpha=0.5, label="Predicted", edgecolor='black')
-    ax.set_xticks([0, 1, 2])
-    ax.set_xticklabels(["DOWN", "NEUTRAL", "UP"])
-    ax.set_title("Prediction Distribution")
-    ax.legend()
-    wandb.log({"prediction_distribution": wandb.Image(fig)})
-    plt.close(fig)
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Path to .pt model checkpoint")
-    args = parser.parse_args()
-
-    # Load checkpoint and sidecar config
-    checkpoint = torch.load(args.model, map_location="cpu")
-    metadata = load_sidecar_config(args.model)
-    model_type = metadata["model_type"]
-    instruments = metadata["instruments"]
-    model_params = metadata["model_params"]
-    training_params = metadata["training_params"]
-    seq_length = training_params.get("seq_length", 64)
-
-    # Read feature columns from training config
-    feature_columns = metadata.get("feature_columns")
-    if not feature_columns:
-        raise ValueError("Missing 'feature_columns' in sidecar config.")
-
-    # Load dataset with correct feature column list
-    features, targets, asset_ids = load_dataset(instruments, seq_length, feature_columns)
-    dataset = TensorDataset(features, targets, asset_ids)
-    loader = DataLoader(dataset, batch_size=512, shuffle=False)
-
-    input_dim = features.shape[2]
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_cls = OptimizedDeribitModel if model_type == "OptimizedDeribitModel" else DeribitHybridModel
-    model = model_cls(input_dim=input_dim, **model_params).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    wandb.init(
-        project="deribit-perpetual-model",
-        name=f"backtest_{os.path.basename(args.model)}",
-        config=metadata
-    )
-
-    y_true, y_pred = [], []
-    per_asset = {inst: [] for inst in instruments}
-
-    with torch.no_grad():
-        for x, y, aid in tqdm(loader, desc="Backtesting"):
-            x, y, aid = x.to(device), y.to(device), aid.to(device)
-            funding_rate = torch.zeros((x.size(0), 1), device=device)
-            out = model(x, funding_rate, aid)
-            preds = torch.argmax(out["direction_logits"], dim=1)
-
-            y_true += y.cpu().tolist()
-            y_pred += preds.cpu().tolist()
-
-            for a, pred, true in zip(aid.cpu().tolist(), preds.cpu().tolist(), y.cpu().tolist()):
-                per_asset[instruments[a]].append(pred == true)
-
-    report = classification_report(y_true, y_pred, labels=[0, 1, 2], output_dict=True)
-    metrics = {
-        "backtest_accuracy": (np.array(y_true) == np.array(y_pred)).mean(),
-        "direction/precision_0": report["0"]["precision"],
-        "direction/recall_0": report["0"]["recall"],
-        "direction/f1_0": report["0"]["f1-score"],
-        "direction/precision_1": report["1"]["precision"],
-        "direction/recall_1": report["1"]["recall"],
-        "direction/f1_1": report["1"]["f1-score"],
-        "direction/precision_2": report["2"]["precision"],
-        "direction/recall_2": report["2"]["recall"],
-        "direction/f1_2": report["2"]["f1-score"]
-    }
-
-    for inst, correct_list in per_asset.items():
-        if correct_list:
-            metrics[f"{inst}_accuracy"] = np.mean(correct_list)
-
-    wandb.log(metrics)
-    log_confusion_matrix(y_true, y_pred)
-    log_prediction_distribution(y_true, y_pred)
-    wandb.finish()
-    print("✅ Enhanced backtest complete — logged everything to Weights & Biases!")
-
-if __name__ == "__main__":
-    main()
 #!/usr/bin/env python3
 """
 backtest.py
@@ -208,6 +36,9 @@ from models.architecture import DeribitHybridModel, OptimizedDeribitModel
 from features.transformers import FeatureTransformer
 from data.database import get_connection, db_connection
 
+# Define terms that indicate future-leaking features
+LEAKY_TERMS = ('future_', 'next_', 'direction_', 'signal_', 'quantile')
+
 def load_sidecar_config(checkpoint_path):
     """
     Load the model configuration from the sidecar JSON file.
@@ -243,45 +74,78 @@ def load_dataset(instruments, seq_length, feature_columns):
     label_cols = ["direction_class"]
 
     for instrument in instruments:
-        path = f"/mnt/p/perpetual/cache/tier1_{instrument}.parquet"
-        if not os.path.exists(path):
-            logger.warning(f"⚠️ Warning: Parquet file not found for {instrument}.")
+        # Try to load from separate Parquet files first (new structure)
+        features_path = f"/mnt/p/perpetual/cache/tier1_features_{instrument}.parquet"
+        labels_path = f"/mnt/p/perpetual/cache/tier1_labels_{instrument}.parquet"
+        
+        # Check if separate files exist
+        if os.path.exists(features_path) and os.path.exists(labels_path):
+            logger.info(f"Loading backtest data for {instrument} from separate files")
+            
+            # Load features and labels
+            features_table = pq.read_table(features_path, memory_map=True)
+            features_df = features_table.to_pandas()
+            
+            labels_table = pq.read_table(labels_path, memory_map=True)
+            labels_df = labels_table.to_pandas()
+            
+            # Verify timestamps match
+            common_timestamps = set(features_df['timestamp']).intersection(set(labels_df['timestamp']))
+            if len(common_timestamps) < min(len(features_df), len(labels_df)) * 0.9:
+                logger.warning(f"⚠️ Significant timestamp mismatch between features and labels for {instrument}")
+                
+            # Filter both dataframes to only include common timestamps
+            features_df = features_df[features_df['timestamp'].isin(common_timestamps)]
+            labels_df = labels_df[labels_df['timestamp'].isin(common_timestamps)]
+            
+            # Sort by timestamp to ensure alignment
+            features_df = features_df.sort_values('timestamp')
+            labels_df = labels_df.sort_values('timestamp')
+                
+            # Safety check: ensure no leaky terms in feature columns
+            safe_feature_columns = []
+            for col in feature_columns:
+                if any(term in col for term in LEAKY_TERMS):
+                    logger.warning(f"⚠️ Found potential leaky feature: {col}. Removing from feature list.")
+                    continue
+                if col in features_df.columns:
+                    safe_feature_columns.append(col)
+                    
+            # Apply transformation
+            transformer = FeatureTransformer(instrument)
+            features_transformed = transformer.transform(features_df[safe_feature_columns])
+                
+        else:
+            logger.error(f"No separate Parquet files found for {instrument}. Please run export_parquet.py first.")
+            continue
+
+        # Fill any NaN values in the labels
+        for col in label_cols:
+            if col in labels_df.columns:
+                labels_df[col] = labels_df[col].fillna(1)  # Default to neutral class (1)
+
+        # Convert to numpy arrays
+        features_np = features_transformed.values.astype(np.float32)
+        targets_np = labels_df[label_cols].values.astype(np.float32)
+
+        # Create sequences
+        num_seqs = len(features_np) - seq_length + 1
+        if num_seqs <= 0:
+            logger.warning(f"Not enough data for {instrument} after sequence creation")
             continue
             
-        logger.info(f"Loading backtest data for {instrument}")
-        table = pq.read_table(path, memory_map=True)
-        df = table.to_pandas()
-
-        if "direction_class" not in df.columns:
-            raise ValueError(f"Missing direction_class in {instrument} data")
-
-        # Validate direction_class is using 0,1,2 schema
-        unique_classes = df["direction_class"].unique()
-        contains_negative = any(x < 0 for x in unique_classes if pd.notna(x))
-        
-        if contains_negative:
-            logger.warning(f"⚠️ Found old class schema (-1,0,1) in {instrument}. Converting to 0,1,2.")
-            # Convert -1 to 0, 0 to 1, 1 to 2
-            df["direction_class"] = df["direction_class"] + 1
-
-        for col in label_cols:
-            df[col].fillna(1, inplace=True)  # Default to neutral class (1)
-
-        transformer = FeatureTransformer(instrument)
-        features_df = transformer.transform(df[feature_columns])
-        targets_df = df[label_cols]
-
-        features_np = features_df.values.astype(np.float32)
-        targets_np = targets_df.values.astype(np.float32)
-
-        num_seqs = len(features_np) - seq_length + 1
         feat_seq = torch.zeros((num_seqs, seq_length, features_np.shape[1]))
         targ_seq = torch.zeros((num_seqs,), dtype=torch.long)
         ids_seq = torch.full((num_seqs,), asset_map[instrument], dtype=torch.long)
 
         for i in range(num_seqs):
-            feat_seq[i] = torch.tensor(features_np[i:i + seq_length])
-            targ_seq[i] = int(targets_np[i + seq_length - 1][0])  # Already using 0,1,2 schema
+            feat_seq[i] = torch.from_numpy(features_np[i:i+seq_length])
+            # Get the target from the end of each sequence
+            target_val = int(targets_np[i + seq_length - 1][0])
+            # Ensure it's a valid class (0, 1, or 2)
+            if target_val not in [0, 1, 2]:
+                target_val = 1  # Default to neutral
+            targ_seq[i] = target_val
             
         all_features.append(feat_seq)
         all_targets.append(targ_seq)
@@ -356,8 +220,9 @@ def log_performance_metrics(instruments, y_true, y_pred, instrument_ids):
     instrument_map = {i: name for i, name in enumerate(instruments)}
     
     for i, instrument in enumerate(instruments):
-        mask = (instrument_ids == i)
-        if not any(mask):
+        # Use array method for mask creation
+        mask = (np.array(instrument_ids) == i)
+        if not mask.any():  # Fixed boolean iteration issue
             continue
             
         inst_true = np.array(y_true)[mask]
